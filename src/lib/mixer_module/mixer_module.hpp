@@ -170,6 +170,20 @@ public:
 	void setAllCenterValues(uint16_t value);
 	void setAllMaxValues(uint16_t value);
 
+	/**
+	 * 反乌龟 / 地面翻正专用：未解锁时也强制输出（仅供 flip_recovery 使用）。
+	 *
+	 * 与 actuator_test 的区别：多路协同、无超时、由调用方每周期刷新。
+	 * 只在该组条件全部满足时生效，否则完全不接管：
+	 *   active && !armed && !kill && !lockdown && !termination
+	 *
+	 * @param outputs 归一化**绝对**油门 [0,1]，0 表示该路停转。
+	 *                方向由调用方（DShot 驱动）另行通过方向命令处理，
+	 *                这里不做符号解释，也不走 _functions[]。
+	 */
+	void setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS]);
+	bool recoveryActive() const { return _recovery_active; }
+
 	/** Disarmed values: disarmedValue < minValue needs to hold */
 	uint16_t &disarmedValue(int index) { return _disarmed_value[index]; }
 	uint16_t &minValue(int index) { return _min_value[index]; }
@@ -291,6 +305,10 @@ private:
 	ActuatorTest _actuator_test{_function_assignment};
 	uint32_t _reversible_mask{0}; ///< per-output bits. If set, the output is configured to be reversible (motors only)
 	bool _was_all_disabled{false};
+
+	// 反乌龟直出（见 setRecoveryOutputs 注释）
+	bool _recovery_active{false};
+	float _recovery_outputs[MAX_ACTUATORS] {};
 
 	uORB::SubscriptionCallbackWorkItem *_subscription_callback{nullptr}; ///< current scheduling callback
 

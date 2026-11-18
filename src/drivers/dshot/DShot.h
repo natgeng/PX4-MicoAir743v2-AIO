@@ -33,12 +33,14 @@
 #pragma once
 
 #include <drivers/drv_dshot.h>
+#include <drivers/drv_hrt.h>
 #include <lib/mixer_module/mixer_module.hpp>
 #include <px4_platform_common/getopt.h>
 #include <px4_platform_common/module.h>
 #include <uORB/topics/esc_status.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
+#include <uORB/topics/flip_recovery_control.h>
 
 #include "DShotTelemetry.h"
 
@@ -136,6 +138,7 @@ private:
 	void update_num_motors();
 
 	void handle_vehicle_commands();
+	void handle_flip_recovery();
 
 	uint16_t convert_output_to_3d_scaling(uint16_t output);
 
@@ -170,6 +173,8 @@ private:
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
+	uORB::Subscription _flip_recovery_sub{ORB_ID(flip_recovery_control)};
+	hrt_abstime _last_flip_recovery{0};
 	uORB::Publication<vehicle_command_ack_s> _command_ack_pub{ORB_ID(vehicle_command_ack)};
 	uint16_t _esc_status_counter{0};
 

@@ -411,6 +411,15 @@ void MixingOutput::setAllDisarmedValues(uint16_t value)
 	}
 }
 
+void MixingOutput::setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS])
+{
+	_recovery_active = active && (outputs != nullptr);
+
+	for (unsigned i = 0; i < MAX_ACTUATORS; i++) {
+		_recovery_outputs[i] = (_recovery_active && outputs != nullptr) ? outputs[i] : NAN;
+	}
+}
+
 void MixingOutput::unregister()
 {
 	if (_subscription_callback) {
@@ -447,6 +456,34 @@ bool MixingOutput::update()
 
 	// check for actuator test
 	_actuator_test.update(_max_num_outputs, _param_thr_mdl_fac.get());
+
+	// 反乌龟直出：与 actuator_test 平行的一条通路，未解锁也允许输出。
+	// 三个前置条件缺一不可：调用方要求接管、车辆确实未解锁、没有 kill/lockdown/termination。
+	// 一旦接管就完全绕开 _functions[]，所以不受 actuator_motors 的 armed 门控影响。
+	if (_recovery_active && !_armed.armed && !_armed.kill && !_armed.lockdown && !_armed.termination) {
+		// 反乌龟不走可逆输出（Bluejay 不支持 3D 油门），方向由驱动层的
+		// DShot 方向命令处理，所以这里强制清掉可逆掩码，避免被当成 3D 编码。
+		_reversible_mask = 0;
+
+		for (int i = 0; i < _max_num_outputs; ++i) {
+			const float value = _recovery_outputs[i];
+
+			// 0 表示该路停转：直接给 disarmed 值。
+			// 不能走 output_limit_calc_single(0)，那会插值成中间油门而不是停转。
+			_current_output_value[i] = (PX4_ISFINITE(value) && value > 0.f)
+						   ? output_limit_calc_single(i, value)
+						   : _disarmed_value[i];
+		}
+
+		if (_interface.updateOutputs(_current_output_value, _max_num_outputs, has_updates)) {
+			actuator_outputs_s actuator_outputs{};
+			setAndPublishActuatorOutputs(_max_num_outputs, actuator_outputs);
+			updateLatencyPerfCounter(actuator_outputs);
+		}
+
+		_was_all_disabled = false;
+		return true;
+	}
 
 	// get output values
 	float outputs[MAX_ACTUATORS];

@@ -472,6 +472,8 @@ void DShot::Run()
 
 	perf_begin(_cycle_perf);
 
+	handle_flip_recovery();
+
 	_mixing_output.update();
 
 	// update output status if armed or if mixer is loaded
@@ -537,6 +539,40 @@ void DShot::Run()
 	_mixing_output.updateSubscriptions(true);
 
 	perf_end(_cycle_perf);
+}
+
+void DShot::handle_flip_recovery()
+{
+	flip_recovery_control_s msg;
+	const bool updated = _flip_recovery_sub.update(&msg);
+
+	// 话题超时（模块退出、崩溃、或模式切走后不再刷新）-> 立即放手，避免电机一直转
+	if (!updated) {
+		if (_mixing_output.recoveryActive() && hrt_elapsed_time(&_last_flip_recovery) > 200_ms) {
+			_mixing_output.setRecoveryOutputs(false, nullptr);
+		}
+
+		return;
+	}
+
+	_last_flip_recovery = msg.timestamp;
+
+	// 只有模块明确要求 DRIVE 时才接管；STOP 一律交回正常路径
+	const bool drive = (msg.action == flip_recovery_control_s::ACTION_DRIVE);
+
+	float outputs[MAX_ACTUATORS] {};
+
+	if (drive) {
+		// 本层只负责油门大小，取绝对值。
+		// 方向（control[i] < 0 -> 电机反转）留给下一阶段：
+		// 需要在电机停转时先发 DShot 方向命令 20/21，再给油门。
+		for (unsigned i = 0; i < 4; ++i) {
+			const float control = msg.control[i];
+			outputs[i] = (control > 0.f) ? control : -control;
+		}
+	}
+
+	_mixing_output.setRecoveryOutputs(drive, outputs);
 }
 
 void DShot::handle_vehicle_commands()

@@ -437,36 +437,151 @@ Commander::updateControlMode() 先 _vehicle_control_mode = {}
 
 ---
 
-# 8. 尚未完成：DShot 出力层
+# 8. DShot 出力层（进行中）
 
-当前链路：
+拆成两层：**能不能输出**（软件门控）和**输出什么方向**（电调能力）。
+
+## 8.1 已完成：未解锁也允许出力
+
+PX4 原本在 `MixingOutput` 里有三道门把未解锁时的输出全部抹成 0：
+
+```cpp
+// 1. 值被抹成 NaN
+if (_armed.armed || (_armed.prearmed && _functions[i]->allowPrearmControl())) {
+    outputs[i] = _functions[i]->value(...);
+} else {
+    outputs[i] = NAN;
+}
+
+// 2. 油门标志只有两种情况下为 true
+_throttle_armed = (_armed.armed && !_armed.lockdown) || _armed.in_esc_calibration_mode;
+
+// 3. 状态机强制归零
+case OutputLimitState::OFF:
+    for (int i = 0; i < num_channels; i++) {
+        _current_output_value[i] = _disarmed_value[i];
+    }
+```
+
+现在加了一条与 `actuator_test` **平行**的通路，完全绕开 `_functions[]`：
+
+```cpp
+void MixingOutput::setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS]);
+
+// update() 里，_actuator_test.update() 之后
+if (_recovery_active && !_armed.armed && !_armed.kill
+    && !_armed.lockdown && !_armed.termination) {
+    _reversible_mask = 0;      // 不走 3D 编码
+
+    for (int i = 0; i < _max_num_outputs; ++i) {
+        const float value = _recovery_outputs[i];
+        _current_output_value[i] = (PX4_ISFINITE(value) && value > 0.f)
+                                   ? output_limit_calc_single(i, value)
+                                   : _disarmed_value[i];
+    }
+
+    if (_interface.updateOutputs(_current_output_value, _max_num_outputs, has_updates)) {
+        ... 发布 actuator_outputs ...
+    }
+
+    return true;
+}
+```
+
+三个安全条件缺一不可：**调用方要求接管** + **确实未解锁** + **没有 kill/lockdown/termination**。
+默认 `_recovery_active = false`，对其它机型、其它模式零影响。
+
+调用方是 `DShot::handle_flip_recovery()`：
+
+```cpp
+void DShot::handle_flip_recovery()
+{
+    flip_recovery_control_s msg;
+    const bool updated = _flip_recovery_sub.update(&msg);
+
+    // 话题超时（模块退出/重启）-> 立即放手
+    if (!updated) {
+        if (_mixing_output.recoveryActive() && hrt_elapsed_time(&_last_flip_recovery) > 200_ms) {
+            _mixing_output.setRecoveryOutputs(false, nullptr);
+        }
+        return;
+    }
+
+    _last_flip_recovery = msg.timestamp;
+
+    const bool drive = (msg.action == flip_recovery_control_s::ACTION_DRIVE);
+
+    float outputs[MAX_ACTUATORS] {};
+    if (drive) {
+        for (unsigned i = 0; i < 4; ++i) {
+            const float control = msg.control[i];
+            outputs[i] = (control > 0.f) ? control : -control;   // 取绝对值
+        }
+    }
+
+    _mixing_output.setRecoveryOutputs(drive, outputs);
+}
+```
+
+`200 ms` 超时是兜底：万一 `flip_recovery` 崩了或被杀，电机不会一直转。
+
+## 8.2 未完成：反向
+
+现在 `control[i]` 的**符号被丢弃**了，所有电机都按出厂方向转。要走完整翻正还需要：
+
+1. **换向时机**：DShot 规范要求方向命令在电机**停转**时发送。
+   `DShot::updateOutputs()` 里只有 `output == DSHOT_DISARM_VALUE(0)` 才会发命令帧，
+   所以必须先停机、发命令、等电调处理、再给油门。
+   参考 LLJ5 的做法：停机 500 ms → 连发 10 帧 → 3 s 超时。
+2. **命令通道**：PX4 原生已有 `DShot_cmd_spin_direction_normal(20)` / `reversed(21)`，
+   `_current_command` 机制可直接复用，但一次只能发一个 motor_mask。
+
+建议的实现：
+
+```cpp
+// ACTION_DRIVE 的第一个阶段：油门保持 0，对 rev_mask 发一次 21，对 fwd_mask 发 20
+if (drive && phase == Direction && !_current_command.valid()) {
+    _current_command.command = msg.rev_mask ? DShot_cmd_spin_direction_reversed
+                                            : DShot_cmd_spin_direction_normal;
+    _current_command.motor_mask = msg.rev_mask;
+    _current_command.num_repetitions = 10;
+    phase = Throttle;
+}
+
+// 第二阶段才真正给油门
+if (drive && phase == Throttle) { ... }
+
+// 退出：对全部发一次 20，把方向复位
+if (!drive && _direction_dirty) { ... }
+```
+
+## 8.3 测试方法
+
+### 先测电调是否支持方向命令（不需要任何新代码）
+
+PX4 原生就有这个 CLI：
 
 ```
-flip_recovery → flip_recovery_control.control[4]
-                        │
-                        └─✗ 没有消费方
+dshot reverse -m 1      # 对 Motor1 发命令 21（反转），重复 10 帧
+dshot normal  -m 1      # 发命令 20（恢复）
 ```
 
-两个阻塞点：
+**拆桨**，执行后用手摸电机轴或听声音（`dshot beep1 -m 1` 也能辅助判断）。
+如果转向真的反了，说明电调支持，8.2 可以做；如果没反应，说明 Bluejay 这个版本不认，
+只能退回"物理换向"方案（换电机线序，但那需要人工干预，不能自动）。
 
-1. **未解锁不输出**：`MixingOutput::output_limit_calc(armed=false)` 走 `OutputLimitState::OFF`，
-   把所有通道强制写成 `_disarmed_value`（DShot 为 0）。`FLIP_OUT_DIRECT` 也绕不过。
-2. **没有反向通道**：DShot 常规模式只有单向油门。要反向只有两条路：
-   - **3D 油门**（`DSHOT_3D_ENABLE=1`，48–1047 反转 / 1047 停 / 1047–2047 正转）——**Bluejay 不支持**
-   - **DShot 方向命令 20/21**（`spin_direction_normal` / `reversed`）——Bluejay 0.19 支持，需实测
+### 再测未解锁出力
 
-建议的下一步：
+```
+param set FLIP_EN 1
+commander mode flip
+```
 
-| 文件 | 要加的东西 |
-|---|---|
-| `src/drivers/dshot/DShot.{h,cpp}` | 订阅 `flip_recovery_control`；`ACTION_DRIVE` 时按 `control[i]` 符号发方向命令 20/21，按绝对值发油门 |
-| `src/lib/mixer_module/mixer_module.{hpp,cpp}` | 加 `setFlipRecoveryOverride(bool, const float[])`：未解锁时也走 `OutputLimitState::ON` |
-| `Done` / `Failed` / 退出模式 | 发 `ACTION_STOP`，驱动侧把方向复位 normal |
+用 `listener flip_recovery_control` 确认模块在发 `ACTION_DRIVE`，
+然后看电机是否在**未解锁**状态下按 `control[]` 的绝对值转起来。
 
-这一步必须上真机验证（不同 Bluejay 版本、不同电调对命令 20/21 的响应不一样），
-代码可以先写，但没有实测的驱动层改动不建议直接进固件。
-
----
+**这一步只能验证"能不能转"，方向还不对**——因为符号被丢弃了。
+正确做法是先按 8.3 第一段确认电调能力，再补 8.2。
 
 # 9. Flash 占用
 

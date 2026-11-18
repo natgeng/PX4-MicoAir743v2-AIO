@@ -3,8 +3,8 @@
 > 落地侧翻或倒扣后，用一个**原生飞行模式**接管电机，按当前姿态自动选出高位/低位电机，
 > 把机身翻回正立，然后自动切回常规模式。
 
-> **状态**：模式接入、姿态算法、参数体系、状态观测全部完成，可编译刷写验证。
-> **DShot 出力层尚未实现**，现在刷进去只能观测，桨不会转（见第 5 节）。
+> **状态**：模式接入、姿态算法、参数体系、状态观测、**未解锁出力**全部完成，可编译刷写验证。
+> **反向（电机换向）尚未接入**，现在刷进去桨能转，但方向只有出厂方向（见第 5 节）。
 
 分支关系：`v1.17.0` → `fix/bdshot-micoair743v2-aio`（BDShot 修复）→ **本分支**
 （已包含 bdshot 修复，可独立编译刷机）
@@ -144,22 +144,54 @@ flip done, switching back to mode 2
 
 退出方式：拨杆拨回 / 发 `SET_MODE` / 翻完自动切回 `FLIP_EXIT_MODE` / `FLIP_EN=0`。
 
-## 5. 尚未完成：DShot 出力层
+## 5. DShot 出力层（进行中）
 
+拆成两层：**能不能输出**（软件门控，已完成）和**输出什么方向**（电调能力，待做）。
+
+### 已完成：未解锁也允许出力
+
+`MixingOutput` 加了一条与 `actuator_test` 平行的通路，完全绕开 `_functions[]` 的 armed 门控：
+
+```cpp
+void MixingOutput::setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS]);
 ```
-flip_recovery → flip_recovery_control.control[4]
-                        │
-                        └─✗ 没有消费方
-```
 
-两个阻塞点：
+三个安全条件缺一不可：调用方要求接管 + 确实未解锁 + 没有 kill/lockdown/termination。
+默认关闭，对其它机型零影响。
 
-1. **未解锁不输出**：`MixingOutput::output_limit_calc(armed=false)` 走 `OutputLimitState::OFF`，
-   把所有通道强制写成 `_disarmed_value`（DShot 为 0）。
-2. **没有反向通道**：DShot 常规模式只有单向油门。Bluejay **不支持 3D 油门**，
-   只能走方向命令 20/21，需实测。
+`DShot::handle_flip_recovery()` 订阅 `flip_recovery_control`，把 `control[]` 的**绝对值**喂进去，
+并带 200 ms 话题超时兜底（模块挂了就自动放手）。
+
+### 待做：反向
+
+现在 `control[i]` 的符号被丢弃，所有电机都按出厂方向转。要完整翻正还需要：
+
+1. **换向时序** —— DShot 方向命令必须在电机**停转**时发，所以要「停机 → 发命令 → 等电调 → 再给油门」
+2. **命令发送** —— 复用 `DShot_cmd_spin_direction_normal(20)` / `reversed(21)`，
+   但 `_current_command` 一次只能一个 motor_mask
 
 详见 [`docs/flip-recovery/README.md` 第 8 节](docs/flip-recovery/README.md)。
+
+### 怎么测
+
+**测电调支不支持方向命令**（不需要任何新代码，PX4 原生就有）：
+
+```
+dshot reverse -m 1      # 对 Motor1 发命令 21，重复 10 帧
+dshot normal  -m 1      # 恢复
+```
+
+拆桨，执行后摸电机轴或听声音。转向真反了 → 电调支持，可以继续做反向；
+没反应 → Bluejay 这个版本不认，只能退回人工换线序。
+
+**测未解锁出力**：
+
+```
+param set FLIP_EN 1
+commander mode flip
+```
+
+看电机是否在未解锁状态下转起来。这一步**只验证能不能转**，方向还不对。
 
 ---
 
