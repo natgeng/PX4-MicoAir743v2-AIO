@@ -39,11 +39,25 @@ constexpr io_timers_t io_timers[MAX_IO_TIMERS] = {
 	initIOTimer(Timer::Timer4, DMA{DMA::Index1}),
 };
 
+/* MicoAir743 AIO: bidirectional DShot fix for the four AIO ESC outputs (TIM1 CH1-4).
+ *
+ * Same configuration as the vendor "bdshot-fixed" build: internal pull-up + 25 MHz slew rate
+ * (instead of the default 50 MHz) on both the output and the capture (input) configuration of
+ * PE14/PE13/PE11/PE9. DShot bit timing is produced by the timer and is unchanged.
+ * Verified against MicoAir743-AIO_PX4-v1.17.0_bdshot-fixed_*.bin (gpio_out/gpio_in = 0x0009144E).
+ */
+static constexpr timer_io_channels_t motorOutput(timer_io_channels_t channel)
+{
+	channel.gpio_out = (channel.gpio_out & ~GPIO_SPEED_MASK) | GPIO_SPEED_25MHz | GPIO_PULLUP;
+	channel.gpio_in = (channel.gpio_in & ~GPIO_SPEED_MASK) | GPIO_SPEED_25MHz | GPIO_PULLUP;
+	return channel;
+}
+
 constexpr timer_io_channels_t timer_io_channels[MAX_TIMER_IO_CHANNELS] = {
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel4}, {GPIO::PortE, GPIO::Pin14}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel3}, {GPIO::PortE, GPIO::Pin13}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel2}, {GPIO::PortE, GPIO::Pin11}),
-	initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel1}, {GPIO::PortE, GPIO::Pin9}),
+	motorOutput(initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel4}, {GPIO::PortE, GPIO::Pin14})),
+	motorOutput(initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel3}, {GPIO::PortE, GPIO::Pin13})),
+	motorOutput(initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel2}, {GPIO::PortE, GPIO::Pin11})),
+	motorOutput(initIOTimerChannel(io_timers, {Timer::Timer1, Timer::Channel1}, {GPIO::PortE, GPIO::Pin9})),
 	initIOTimerChannel(io_timers, {Timer::Timer3, Timer::Channel4}, {GPIO::PortB, GPIO::Pin1}),
 	initIOTimerChannel(io_timers, {Timer::Timer3, Timer::Channel3}, {GPIO::PortB, GPIO::Pin0}),
 	initIOTimerChannel(io_timers, {Timer::Timer4, Timer::Channel1}, {GPIO::PortD, GPIO::Pin12}),
