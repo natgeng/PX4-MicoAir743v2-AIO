@@ -162,6 +162,14 @@ void getModeRequirements(uint8_t vehicle_type, failsafe_flags_s &flags)
 	setRequirement(vehicle_status_s::NAVIGATION_STATE_STAB, flags.mode_req_attitude);
 	setRequirement(vehicle_status_s::NAVIGATION_STATE_STAB, flags.mode_req_manual_control);
 
+	// NAVIGATION_STATE_FLIP_RECOVERY
+	// 需要姿态 + 角速度才能算倾角和电机相对地面高度；需要遥控以便随时拨杆退出。
+	// mode_req_prevent_arming：该模式只允许在地面未解锁时使用，绝不允许带着翻正模式起飞。
+	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_angular_velocity);
+	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_attitude);
+	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_manual_control);
+	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_prevent_arming);
+
 	// NAVIGATION_STATE_AUTO_TAKEOFF
 	setRequirement(vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF, flags.mode_req_angular_velocity);
 	setRequirement(vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF, flags.mode_req_attitude);

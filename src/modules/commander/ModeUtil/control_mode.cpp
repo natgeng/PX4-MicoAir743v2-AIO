@@ -62,6 +62,12 @@ void getVehicleControlMode(uint8_t nav_state, uint8_t vehicle_type,
 		vehicle_control_mode.flag_control_allocation_enabled = true;
 		break;
 
+	case vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY:
+		// 翻正模式不使用任何控制器：所有 flag 保持 false。
+		// 电机输出由 flip_recovery 模块独占（control_allocator 在该模式下让位），
+		// 因此这里既不置 attitude/rate，也不置 allocation。
+		break;
+
 	case vehicle_status_s::NAVIGATION_STATE_ALTCTL:
 	case vehicle_status_s::NAVIGATION_STATE_ALTITUDE_CRUISE:
 		vehicle_control_mode.flag_control_manual_enabled = true;
