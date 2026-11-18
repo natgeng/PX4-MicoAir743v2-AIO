@@ -78,68 +78,92 @@ param save
 | `FLIP_SLEW` / `FLIP_TIME` | 0.50 / 3.0 | 油门上升率 / 总出力上限 |
 | `FLIP_MIN_PROG` / `FLIP_PROG_T` | 3.0 / 0.80 | 进度检查阈值 / 起始时间 |
 
-### 3. 触发（任选一种）
+### 3. 触发
 
-四条路径最终都落到 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
+四种方式，最终都落到 `vehicle_status.nav_state = 16`。
 
-**遥控器拨杆**：`COM_FLTMODE5 = 17` 设好后拨到第 5 档。
+#### A. QGC 参数页（不用写代码）
 
-**MAVLink `SET_MODE`**：
+1. QGC 左侧 **齿轮 -> Parameters**，搜索 `COM_FLTMODE`
+2. 把 `COM_FLTMODE5` 设成 **Flip Recovery**，点 Save
+3. 有遥控就拨到第 5 档；没遥控就走 **MAVLink Console** 输入 `commander mode flip`
+
+> 下拉里能出现 "Flip Recovery"，是因为固件在 `commander/module.yaml` 里把这个枚举描述成
+> `17: Flip Recovery`。
+>
+> **QGC 的 "Flight Modes" 页面里没有这个模式** —— 那个页面的列表是 QGC 硬编码的，
+> 必须走 **Parameters** 页面。
+
+#### B. 遥控器拨杆
+
+先在 QGC -> **Vehicle Setup -> Radio** 完成遥控器和开关校准，然后：
+
+| 开关位置 | 对应参数 |
+|---|---|
+| 第 1 档 | `COM_FLTMODE1` |
+| 第 2 档 | `COM_FLTMODE2` |
+| ... | ... |
+| 第 6 档 | `COM_FLTMODE6` |
+
+把想用的那一档设成 **Flip Recovery**，拨过去即可；拨回任意其它档立即收油。
+
+可选二次确认（防误碰）：`FLIP_RC_CONFIRM = 6` 要求 aux6 通道同时在高位。
+
+#### C. ROS2 话题（和发降落一样简单）
 
 ```python
-master.mav.set_mode_send(
-    master.target_system,
-    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-    (12 << 16)          # custom_mode = main_mode(12) << 16 | sub_mode(0)
-)
+from px4_msgs.msg import VehicleCommand
+
+cmd = VehicleCommand()
+cmd.timestamp        = int(self.get_clock().now().nanoseconds / 1000)
+cmd.command          = 10071     # VEHICLE_CMD_SET_NAV_STATE
+cmd.param1           = 16.0      # NAVIGATION_STATE_FLIP_RECOVERY
+cmd.target_system    = 1
+cmd.target_component = 1
+cmd.from_external    = True
+self.cmd_pub.publish(cmd)
 ```
 
-**MAVLink `MAV_CMD_DO_SET_MODE`**：
+对比发降落只差一行：那边是 `cmd.command = VehicleCommand.VEHICLE_CMD_NAV_LAND`。
+`10071` 直接给 `nav_state` 数值，不用换算 `custom_mode` 位域。
 
-```python
-master.mav.command_long_send(
-    master.target_system, master.target_component,
-    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-    1,      # CUSTOM_MODE_ENABLED
-    12,     # PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
-    0, 0, 0, 0, 0
-)
-```
-
-**uORB / ROS2**：
-
-```python
-msg.command = 176     # VEHICLE_CMD_DO_SET_MODE
-msg.param1 = 1.0
-msg.param2 = 12.0
-msg.param3 = 0.0
-# 更直接：
-msg.command = 10071   # VEHICLE_CMD_SET_NAV_STATE
-msg.param1 = 16.0     # NAVIGATION_STATE_FLIP_RECOVERY
-```
-
-**命令行**：
+#### D. 板载命令行
 
 ```
 commander mode flip
 ```
 
-### 观测与退出
+### 4. 执行结果回传
+
+翻正结束（成功或失败）后模块持续发布 `flip_recovery_status`，上位机订阅它就能发下一步：
+
+```python
+from px4_msgs.msg import FlipRecoveryStatus
+
+def status_cb(self, msg):
+    if msg.result == FlipRecoveryStatus.RESULT_SUCCESS:
+        # 用时 msg.duration_s，结束倾角 msg.tilt_deg
+        # 下一步：解锁 / 起飞 / 切回 Position
+        pass
+    elif msg.result == FlipRecoveryStatus.RESULT_FAILED:
+        # msg.reason: 1=TIMEOUT 2=NO_PROGRESS 3=SAFETY_LOST 4=MODE_EXITED 5=ATTITUDE_RESET
+        pass
+```
+
+`result` 会一直保持到最后一次结果，直到下次开始出力才回到 `RESULT_NONE`，
+所以上位机要按**跳变**去重，或者用 `session_id` 区分不同的尝试。
+
+### 5. 观测与退出
 
 ```
-listener flip_recovery_control
-flip_recovery status
+listener flip_recovery_control      # 倾角、zone、掩码、逐路油门
+listener flip_recovery_status       # 执行结果、时长、失败原因
+flip_recovery status                # 全部内部状态
 ```
 
-```
-flip state 1: ramping up (tilt 121.3)
-flip zone 2 (tilt 121): HIGH(m0c) reversed @ 0.20 [lifts] | LOW(m03) reversed @ 0.10
-flip done, switching back to mode 2
-```
+退出：拨杆拨回 / 在 QGC 切到其它模式 / 翻完自动切回 `FLIP_EXIT_MODE` / `FLIP_EN=0`。
 
-退出：拨杆拨回 / 发 `SET_MODE` / 翻完自动切回 / `FLIP_EN=0`。
-
-### 安全约束（已内置）
+### 6. 安全约束（已内置）
 
 | 约束 | 实现 |
 |---|---|
@@ -149,7 +173,7 @@ flip done, switching back to mode 2
 | 方向配反自动停 | 0.8 s 内倾角没减小就 `Failed` |
 | 失败后必须退出模式才能重试 | `_rearm_needed` |
 
-### 当前限制
+### 7. 当前限制
 
 - **桨能转，但方向只有出厂方向** —— DShot 反向（命令 20/21）还没接入。
   Bluejay 0.19.2 官方支持命令 21（turtle mode），所以预期可行，但需要真机确认。
