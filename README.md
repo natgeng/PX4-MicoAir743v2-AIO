@@ -1,111 +1,217 @@
 # `feat/flip-recovery` — 反乌龟 / 侧翻自动纠正
 
-> **状态：规划中，暂无实现代码。** 本分支目前只比 `fix/bdshot-micoair743v2-aio` 多一个文档：`docs/flip-recovery/README.md`。
->
-> 分支关系：`v1.17.0` → `fix/bdshot-micoair743v2-aio`（BDShot 修复）→ **本分支**。
-> 也就是说这里已经**包含** bdshot 修复，可以独立编译刷机，只是还不会翻正。
+> 落地侧翻或倒扣后，用一个**原生飞行模式**接管电机，按当前姿态自动选出高位/低位电机，
+> 把机身翻回正立，然后自动切回常规模式。
+
+> **状态**：模式接入、姿态算法、参数体系、状态观测全部完成，可编译刷写验证。
+> **DShot 出力层尚未实现**，现在刷进去只能观测，桨不会转（见第 5 节）。
+
+分支关系：`v1.17.0` → `fix/bdshot-micoair743v2-aio`（BDShot 修复）→ **本分支**
+（已包含 bdshot 修复，可独立编译刷机）
 
 | 项目 | 值 |
 |---|---|
-| 基线 | `fix/bdshot-micoair743v2-aio`（= PX4 v1.17.0 + bdshot 修复） |
+| 基线 | PX4 v1.17.0 `d6f12ad1c4f70ad3230afd7d86e971421e02fef4` |
 | 目标硬件 | MicoAir743v2-AIO-35A（target `micoair_h743-v2`，board_id 1179） |
-| 相对基线的差异 | 仅 `docs/flip-recovery/README.md`（31 行） |
-| 计划新增 | `src/modules/flip_recovery/`（模块 + 参数 + 状态机） |
+| 新增飞行模式 | `NAVIGATION_STATE_FLIP_RECOVERY = 16`（复用 FREE1 槽位） |
+| 新增参数 | 14 个 `FLIP_*` |
+| 详细文档 | [`docs/flip-recovery/README.md`](docs/flip-recovery/README.md) |
 
 ---
 
-## 1. 要做的两件事
+# 使用说明（必读）
 
-| 能力 | 触发 | 说明 |
-|---|---|---|
-| **反乌龟**（Turtle / crash flip） | 飞行员开关 + 摇杆 | 倒扣时用对角两台电机反向出力，把机身翻正 |
-| **侧翻纠正**（自控版） | 姿态超过阈值自动 | 无需摇杆，自动执行翻正序列，失败则停 |
-
-两者的物理原理相同：绕一条着地对角线产生力矩。区别只在"谁来选方向"——人控制 or 自己判断。
-
-## 2. 前置条件（不满足就别做）
-
-1. 电调支持 **DShot 临时方向命令 20/21**（AM32 已验证；本板 Bluejay 0.19.2 **待实测**）；
-2. 电机几何为 **Quad-X**，M1–M4 同属 TIM1（本板满足）；
-3. 必须有的安全门限：**上锁才能进入**、油门为 0、姿态贴地门限、单次时长与总时长上限、退出立即恢复电机方向；
-4. flash 余量：本板 app 已 1,903,424 B / 上限 1,966,080 B，**只剩 61 KB**，新模块必须精简。
-
-## 3. 设计草案
-
-预期新增：
-
-```
-src/modules/flip_recovery/
-├── CMakeLists.txt
-├── Kconfig
-├── flip_recovery_params.c      # FLIP_*
-├── FlipRecovery.cpp/.hpp        # 主循环 + 门限判断
-└── FlipSequence.hpp             # 状态机：等待→反转→出力→滑行→恢复
-```
-
-状态机（草案）：
-
-```
-WAIT_REST ──┬─ 倒扣静止 + 开关使能 ──> REVERSE (发 DShot 21，5 组 burst 中间插 STOP)
-            └─ 姿态不满足 ──> 停留
-REVERSE ──> DRIVE (对角两路出力，TRTL_MAX 限幅，roll/pitch 或固定方向)
-DRIVE ──> COAST (收油，靠惯性+地面接触继续翻)
-COAST ──> RECOVER (发 DShot 20 恢复方向) ──> DONE / FAIL(超时/无进展)
-```
-
-参数草案（对齐业界命名）：
-
-| 参数 | 含义 | 默认 |
-|---|---|---|
-| `FLIP_EN` | 总开关（需重启） | 0 |
-| `FLIP_AUX` | 触发通道 AUX1–6 | 1 |
-| `FLIP_MAX_THR` | 出力上限（DShot 油门比例） | 0.20 |
-| `FLIP_TIME` | 单次最长出力 | 2.5 s |
-| `FLIP_NO_PROG` | 无进展超时 | 1.2 s |
-| `FLIP_ANGLE` | 判定"已翻正"的剩余倾角 | 25° |
-
-## 4. 参考实现
-
-| 项目 | 特点 | 可借鉴点 |
-|---|---|---|
-| [PX4 PR #29750](https://github.com/PX4/PX4-Autopilot/pull/29750) | 最原生（commander / control_allocator / dshot 全链路），手控 | 官方架构怎么接；`MotorDirectionRequest/Status` 消息设计 |
-| [LLJ5/PX4_Turtle_Mico](https://github.com/LLJ5/PX4_Turtle_Mico) | **自动右翻**，基线正好是 v1.17.0 / `d6f12ad1c4` | 自动判定与状态机、四元数判正反面 |
-| [BENSHLOMO/px4-fpv-extensions](https://github.com/BENSHLOMO/px4-fpv-extensions) | 21 个 `TRTL_*` 参数可配，MicoAir H743 V2 验证过 | 参数化程度、电机映射可配 |
-| [ArduPilot mode_turtle.cpp](https://github.com/ArduPilot/ardupilot/blob/master/ArduCopter/mode_turtle.cpp) | 原生模式，面向所有 DShot 多旋翼 | `enabled()` 判定、方向命令下发方式 |
-
-## 5. 计划步骤
-
-- [ ] **实测本板电调是否响应 DShot 20/21**（拆桨；先 `dshot turtle_reverse` 再手动确认转向）
-- [ ] 选定基座：cherry-pick PR #29750，或移植 LLJ5 的自动版（倾向后者：同基线、已自动）
-- [ ] 建模块骨架 + 参数，先只做"上锁 + 开关 + 姿态判定"，不输出
-- [ ] 接入 DShot 方向命令（burst + STOP 序列 + 状态回报）
-- [ ] 混控：只驱动对角两路，绕过 `control_allocator` 的常规路径
-- [ ] 台架：拆桨验证方向与时限 → 垫软物倒扣 10% 推力 → 带桨低推力 → 连续 10 次 → 翻正后正常起飞
-- [ ] 全流程拉 `logger` 日志，`replay` 复核无越界输出
-
-## 6. 构建
+## 1. 编译与刷写
 
 ```bash
-git clone --recursive -b feat/flip-recovery \
-    https://github.com/natgeng/PX4-MicoAir743v2-AIO.git
-cd PX4-MicoAir743v2-AIO
-bash ./Tools/setup/ubuntu.sh
-make micoair_h743-v2_default -j$(nproc)
+make micoair_h743-v2_default
 ```
 
-当前编译产物与 `fix/bdshot-micoair743v2-aio` **行为完全一致**（只多了文档），可以安全刷机验证基线功能。
+只刷 app，**不要动 bootloader**。QGC 里选 `.px4` 文件即可。
 
-## 7. 其他分支
+## 2. 参数配置
 
-| 分支 | 内容 |
-|---|---|
-| `fix/bdshot-micoair743v2-aio` | BDShot 修复（本分支的基线） |
-| `main` | 与上游 `PX4/PX4-Autopilot` 保持一致 |
+### 必须先设的两项
 
-## 许可
+```
+param set FLIP_EN 1            # 总开关，0 = 拨进模式也不转桨
+param set COM_FLTMODE5 17      # 把第 5 档模式开关映射成 Flip Recovery
+param save
+```
 
-基于 PX4-Autopilot，遵循 **BSD 3-Clause**（见 `LICENSE`）。
+> `COM_FLTMODE1..6` 是模式槽位，值 17 = Flip Recovery。
+> 不用拨杆的话这一项可以跳过，直接发指令触发。
+
+### 常用可调参数
+
+| 参数 | 默认 | 范围 | 作用 |
+|---|---|---|---|
+| **`FLIP_EN`** | 0 | bool | **总开关**。0 时模式可进、状态可见，但不转桨 |
+| **`FLIP_THR_HIGH`** | 0.20 | 0.02–0.6 | **高位组油门**。唯一真正决定翻正快慢的参数，从 0.15 起步 |
+| **`FLIP_THR_LOW`** | 0.10 | 0–0.6 | **低位组油门**。只负责卸压/减摩擦，正常应明显低于高位 |
+| **`FLIP_LOW_MODE`** | 0 | 0–3 | 低位转向调试：`0`=Auto（永远抬）、`1`=强制正转、`2`=强制反转、`3`=关闭 |
+| **`FLIP_MODE`** | 0 | 0–1 | 策略：`0`=翻过去（90–180° 抬高位翻过 180°）、`1`=压回去（全程压高位，路径最短） |
+| `FLIP_ENTRY_ANG` | 75 | 60–180 | 超过这个倾角才出力 |
+| `FLIP_STOP_ANG` | 60 | 0–120 | 低于这个倾角收油，交给重力 |
+| `FLIP_EXIT_MODE` | 2 | 0–8 | 翻完自动切回的模式（2 = Position） |
+| `FLIP_RC_CONFIRM` | 0 | 0–6 | 0 = 免二次确认；1–6 = 还要对应 aux 通道在高位 |
+| `FLIP_SLEW` | 0.50 | 0.05–2.0 | 油门上升率（1/s） |
+| `FLIP_TIME` | 3.0 | 0.2–5.0 | 总出力时长上限（s） |
+| `FLIP_MIN_PROG` | 3.0 | 0–30 | 进度检查阈值（度） |
+| `FLIP_PROG_T` | 0.80 | 0.2–2.0 | 多久后开始查进度（s） |
+| `FLIP_OUT_DIRECT` | 0 | bool | 1 = 台架直发 `actuator_motors` |
+
+## 3. 触发方式（任选一种）
+
+四条路径最终都落到同一个 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
+
+### 方式 A：遥控器拨杆
+
+`COM_FLTMODE5 = 17` 设好后，把模式开关拨到第 5 档。
+
+### 方式 B：MAVLink `SET_MODE`（推荐给上位机）
+
+```python
+from pymavlink import mavutil
+
+master = mavutil.mavlink_connection('udp:127.0.0.1:14550')
+master.wait_heartbeat()
+
+master.mav.set_mode_send(
+    master.target_system,
+    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+    (12 << 16)          # custom_mode = main_mode(12) << 16 | sub_mode(0)
+)
+```
+
+### 方式 C：MAVLink `MAV_CMD_DO_SET_MODE`
+
+```python
+master.mav.command_long_send(
+    master.target_system, master.target_component,
+    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+    1,      # param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+    12,     # param2 = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
+    0, 0, 0, 0, 0
+)
+```
+
+### 方式 D：uORB 话题（ROS2 / px4_ros2）
+
+```python
+from px4_msgs.msg import VehicleCommand
+
+msg = VehicleCommand()
+msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
+msg.command = 176            # VEHICLE_CMD_DO_SET_MODE
+msg.param1 = 1.0             # CUSTOM_MODE_ENABLED
+msg.param2 = 12.0            # PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
+msg.param3 = 0.0
+msg.target_system = 1
+msg.target_component = 1
+msg.from_external = True
+self.publisher.publish(msg)
+```
+
+更直接（跳过 custom_mode 换算）：
+
+```python
+msg.command = 10071          # VEHICLE_CMD_SET_NAV_STATE
+msg.param1 = 16.0            # NAVIGATION_STATE_FLIP_RECOVERY
+```
+
+### 方式 E：命令行 / MAVLink Console
+
+```
+commander mode flip
+```
+
+## 4. 观测与退出
+
+```
+listener flip_recovery_control      # 倾角、zone、掩码、逐路油门、状态机
+flip_recovery status                # 一次打印全部内部状态
+```
+
+正常会看到：
+
+```
+flip state 1: ramping up (tilt 121.3)
+flip zone 2 (tilt 121): HIGH(m0c) reversed @ 0.20 [lifts] | LOW(m03) reversed @ 0.10
+flip state 3: tilt below stop angle, gravity takes over
+flip done, switching back to mode 2
+```
+
+退出方式：拨杆拨回 / 发 `SET_MODE` / 翻完自动切回 `FLIP_EXIT_MODE` / `FLIP_EN=0`。
+
+## 5. 尚未完成：DShot 出力层
+
+```
+flip_recovery → flip_recovery_control.control[4]
+                        │
+                        └─✗ 没有消费方
+```
+
+两个阻塞点：
+
+1. **未解锁不输出**：`MixingOutput::output_limit_calc(armed=false)` 走 `OutputLimitState::OFF`，
+   把所有通道强制写成 `_disarmed_value`（DShot 为 0）。
+2. **没有反向通道**：DShot 常规模式只有单向油门。Bluejay **不支持 3D 油门**，
+   只能走方向命令 20/21，需实测。
+
+详见 [`docs/flip-recovery/README.md` 第 8 节](docs/flip-recovery/README.md)。
 
 ---
 
-个人开发存档，非官方发布。翻正涉及电机反向出力，**务必拆桨验证**后再上桨测试。
+# 这个分支改了什么
+
+## 新增
+
+| 文件 | 内容 |
+|---|---|
+| `msg/FlipRecoveryControl.msg` | 控制请求：`state` / `action` / `zone` / 掩码 / `float32[4] control` / `tilt_deg` |
+| `src/lib/flip_recovery/FlipPlanner.hpp` | 纯逻辑：倾角、选边、方向映射、状态机、逐路油门 |
+| `src/modules/flip_recovery/` | 模块骨架 + 14 个参数 + 构建配置 |
+| `docs/flip-recovery/` | 完整文档 |
+
+## 修改
+
+| 文件 | 改了什么 | 为什么 |
+|---|---|---|
+| `msg/versioned/VehicleStatus.msg` | `FREE1=16` → `FLIP_RECOVERY=16` | 复用空闲槽位，`MAX` 保持 31 |
+| `commander/px4_custom_mode.h` | 加 `MAIN_MODE_FLIP_RECOVERY`（=12） | MAVLink `custom_mode` 字节 |
+| `lib/modes/ui.hpp` | 有效模式位 + 显示名 | 不加位切换被判非法 |
+| `ModeUtil/control_mode.cpp` | 该模式所有 flag 保持 false | 让 `control_allocator` 停止发布 `actuator_motors` |
+| `ModeUtil/mode_requirements.cpp` | 加 `prevent_arming` 等 | 禁止带着翻正模式解锁 |
+| `Commander.cpp` | `DO_SET_MODE` 分支 + CLI | 所有触发路径的汇聚点 |
+| `commander/module.yaml` | `17: Flip Recovery` | QGC 下拉选项 |
+| `manual_control/ManualControl.cpp` | `navStateFromParam` case 17 | 拨杆链路 |
+| `boards/.../default.px4board` | `CONFIG_MODULES_FLIP_RECOVERY=y` | 编译进固件 |
+| `boards/.../rc.board_extras` | 无条件启动模块 | 模式化后必须常驻 |
+
+## 核心原理（三段话）
+
+**选边**：倾斜时贴地的那两路电机，其连线就是翻正转轴。它们力臂≈0，只负责"抬一点"卸掉地面压力；
+真正干活的是高位两路，力臂最大。
+
+**方向**：`Normal`（出厂转向）产生的机身受力方向由 `R(2,2)=cos(tilt)` 决定——
+正立时朝上，倒扣后朝下。所以只在 90° 处换算一次，其余全部用 `Push::Up/Down` 表达。
+
+**策略**：`FLIP_MODE=0`（默认）在 60–90° 压高位回正、90–180° 抬高位翻过 180°，高位全程 Reversed；
+`FLIP_MODE=1` 全程压高位，路径最短但 90° 要换向。
+
+---
+
+# 文档
+
+| 文件 | 内容 |
+|---|---|
+| [`docs/flip-recovery/README.md`](docs/flip-recovery/README.md) | 完整实现说明：架构、数据流、算法推导、逐文件改动、调试流程 |
+| [`docs/flip-recovery/IMPLEMENTATION.md`](docs/flip-recovery/IMPLEMENTATION.md) | 演进记录（每次设计变更与纠错） |
+
+---
+
+# 刷写注意
+
+两个分支都可以只刷 app，bootloader 不动。QGC 刷 `.px4` 文件即可，
+MAVLink 刷写不会覆盖 bootloader，也不会丢电调校准。
