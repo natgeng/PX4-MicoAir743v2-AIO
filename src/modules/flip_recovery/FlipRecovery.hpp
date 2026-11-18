@@ -27,6 +27,7 @@
 #include <uORB/topics/actuator_armed.h>
 #include <uORB/topics/actuator_motors.h>
 #include <uORB/topics/flip_recovery_control.h>
+#include <uORB/topics/flip_recovery_status.h>
 #include <uORB/topics/manual_control_setpoint.h>
 #include <uORB/topics/parameter_update.h>
 #include <uORB/topics/vehicle_angular_velocity.h>
@@ -52,6 +53,7 @@ private:
 	void Run() override;
 	void updateLayout();
 	void publishControl(const flip_recovery::Plan &plan, bool dry_run);
+	void publishStatus(const flip_recovery::Plan &plan);
 	void requestExitMode();
 	float auxInput() const;
 
@@ -69,6 +71,7 @@ private:
 	uORB::Subscription _armed_sub{ORB_ID(actuator_armed)};
 
 	uORB::Publication<flip_recovery_control_s> _control_pub{ORB_ID(flip_recovery_control)};
+	uORB::Publication<flip_recovery_status_s> _flip_status_pub{ORB_ID(flip_recovery_status)};
 	uORB::Publication<actuator_motors_s> _motors_pub{ORB_ID(actuator_motors)};
 	uORB::Publication<vehicle_command_s> _command_pub{ORB_ID(vehicle_command)};
 
@@ -92,6 +95,11 @@ private:
 	float _tilt{NAN};
 	uint8_t _quat_reset{0};
 	flip_recovery::Zone _last_zone{flip_recovery::Zone::Off};
+
+	// 给上位机的执行结果（见 flip_recovery_status.msg）
+	uint64_t _session_start{0};
+	uint8_t _result{flip_recovery_status_s::RESULT_NONE};
+	float _duration{0.f};
 
 	DEFINE_PARAMETERS(
 		(ParamBool<px4::params::FLIP_EN>)         _param_en,

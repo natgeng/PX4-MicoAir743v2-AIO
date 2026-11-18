@@ -131,6 +131,16 @@ struct Input {
 	float gyro[3] {};         // rad/s，仅用于日志
 };
 
+// 失败原因码，数值与 msg/FlipRecoveryStatus.msg 的 REASON_* 一一对应
+enum ReasonCode : uint8_t {
+	ReasonNone = 0,
+	ReasonTimeout = 1,
+	ReasonNoProgress = 2,
+	ReasonSafetyLost = 3,
+	ReasonModeExited = 4,
+	ReasonAttitudeReset = 5,
+};
+
 struct Plan {
 	bool active{false};
 	uint8_t state{0};         // 与 Plan::State 数值一致，直接写进 uORB 消息
@@ -143,6 +153,7 @@ struct Plan {
 	// 必须逐路给：策略 A 的 90~180° 段高/低位同为 Reversed，但油门不同（全额 vs 打折）。
 	float control[4] {};
 	float tilt_deg{0.f};
+	uint8_t reason_code{ReasonNone};   // 失败原因，见 ReasonCode
 	const char *reason{"idle"};
 };
 
@@ -179,7 +190,7 @@ public:
 		// 模式退出：任何进行中的会话立即终止，并允许下次重新触发
 		if (!in.mode_active) {
 			if (_state == State::Ramp || _state == State::Hold) {
-				fail("mode exited");
+				fail("mode exited", ReasonModeExited);
 
 			} else if (_state == State::Coast) {
 				_state = State::Done;
@@ -230,7 +241,7 @@ public:
 
 		// ---- 5. 运行中掉安全条件 -> 直接停 ----
 		if (!in.safe || !in.enabled) {
-			fail("safety lost or disabled");
+			fail("safety lost or disabled", ReasonSafetyLost);
 		}
 
 		// ---- 6. 选择工作区 ----
@@ -252,11 +263,11 @@ public:
 				_reason = "tilt below stop angle, gravity takes over";
 
 			} else if (in.now - _started >= static_cast<uint64_t>(s.max_time * 1e6f)) {
-				fail("timeout");
+				fail("timeout", ReasonTimeout);
 
 			} else if (in.now - _started >= static_cast<uint64_t>(s.progress_time * 1e6f)
 				   && (_start_tilt - tilt) < s.min_progress) {
-				fail("no tilt progress (wrong side or too little throttle)");
+				fail("no tilt progress (wrong side or too little throttle)", ReasonNoProgress);
 			}
 		}
 
@@ -339,6 +350,7 @@ public:
 			if (tilt <= s.stop_angle || in.now - _coast_started > 1500000) {
 				_state = State::Done;
 				_rearm_needed = true;
+				_fail_code = ReasonNone;
 				_reason = "done (gravity settling)";
 			}
 
@@ -387,6 +399,7 @@ public:
 		}
 
 		out.tilt_deg = tilt;
+		out.reason_code = _fail_code;
 		out.reason = _reason;
 		return out;
 	}
@@ -397,12 +410,13 @@ public:
 	float tilt() const { return _tilt; }
 	float throttle() const { return _thr; }
 
-	void fail(const char *why)
+	void fail(const char *why, uint8_t code = ReasonNone)
 	{
 		_state = State::Failed;
 		_thr = 0.f;
 		_rearm_needed = true;
 		_reason = why;
+		_fail_code = code;
 	}
 
 	// 四元数 -> alignment（R(2,2)）；模长异常返回 false
@@ -456,6 +470,7 @@ public:
 private:
 	State _state{State::Idle};
 	bool _rearm_needed{false};   // Done/Failed 后置位，模式退出才清零
+	uint8_t _fail_code{ReasonNone};
 	uint64_t _session{0}, _started{0}, _last_now{0}, _coast_started{0};
 	float _start_tilt{0.f}, _thr{0.f}, _tilt{NAN};
 	const char *_reason{"idle"};

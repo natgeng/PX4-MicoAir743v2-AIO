@@ -61,90 +61,94 @@ param save
 | `FLIP_PROG_T` | 0.80 | 0.2–2.0 | 多久后开始查进度（s） |
 | `FLIP_OUT_DIRECT` | 0 | bool | 1 = 台架直发 `actuator_motors` |
 
-## 3. 触发方式（任选一种）
+## 3. 触发方式
 
-四条路径最终都落到同一个 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
+四种方式，最终都落到 `vehicle_status.nav_state = 16`。按场景选一种即可。
 
-### 方式 A：遥控器拨杆
+### A. QGC 参数页（不用写代码）
 
-`COM_FLTMODE5 = 17` 设好后，把模式开关拨到第 5 档。
+1. QGC 左侧 **齿轮 → Parameters**，搜索 `COM_FLTMODE`
+2. 把 `COM_FLTMODE5` 设成 **Flip Recovery**，点 Save
+3. 有遥控就拨到第 5 档；没遥控就走 **MAVLink Console** 输入 `commander mode flip`
 
-### 方式 B：MAVLink `SET_MODE`（推荐给上位机）
+> 下拉里能出现 "Flip Recovery"，是因为固件在 `commander/module.yaml` 里把这个枚举描述成
+> `17: Flip Recovery`。
+>
+> **QGC 的 "Flight Modes" 页面里没有这个模式** —— 那个页面的列表是 QGC 硬编码的，
+> 必须走 **Parameters** 页面。
 
-```python
-from pymavlink import mavutil
+### B. 遥控器拨杆
 
-master = mavutil.mavlink_connection('udp:127.0.0.1:14550')
-master.wait_heartbeat()
+先在 QGC → **Vehicle Setup → Radio** 完成遥控器和开关校准，然后：
 
-master.mav.set_mode_send(
-    master.target_system,
-    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-    (12 << 16)          # custom_mode = main_mode(12) << 16 | sub_mode(0)
-)
-```
+| 开关位置 | 对应参数 |
+|---|---|
+| 第 1 档 | `COM_FLTMODE1` |
+| 第 2 档 | `COM_FLTMODE2` |
+| … | … |
+| 第 6 档 | `COM_FLTMODE6` |
 
-### 方式 C：MAVLink `MAV_CMD_DO_SET_MODE`
+把想用的那一档设成 **Flip Recovery**，拨过去即可；拨回任意其它档立即收油。
 
-```python
-master.mav.command_long_send(
-    master.target_system, master.target_component,
-    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-    1,      # param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-    12,     # param2 = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
-    0, 0, 0, 0, 0
-)
-```
+可选二次确认（防误碰）：`FLIP_RC_CONFIRM = 6` 要求 aux6 通道同时在高位。
 
-### 方式 D：uORB 话题（ROS2 / px4_ros2）
+### C. ROS2 话题（和发降落一样简单）
 
 ```python
 from px4_msgs.msg import VehicleCommand
 
-msg = VehicleCommand()
-msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-msg.command = 176            # VEHICLE_CMD_DO_SET_MODE
-msg.param1 = 1.0             # CUSTOM_MODE_ENABLED
-msg.param2 = 12.0            # PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
-msg.param3 = 0.0
-msg.target_system = 1
-msg.target_component = 1
-msg.from_external = True
-self.publisher.publish(msg)
+cmd = VehicleCommand()
+cmd.timestamp        = int(self.get_clock().now().nanoseconds / 1000)
+cmd.command          = 10071     # VEHICLE_CMD_SET_NAV_STATE
+cmd.param1           = 16.0      # NAVIGATION_STATE_FLIP_RECOVERY
+cmd.target_system    = 1
+cmd.target_component = 1
+cmd.from_external    = True
+self.cmd_pub.publish(cmd)
 ```
 
-更直接（跳过 custom_mode 换算）：
+对比发降落只差一行：那边是 `cmd.command = VehicleCommand.VEHICLE_CMD_NAV_LAND`。
 
-```python
-msg.command = 10071          # VEHICLE_CMD_SET_NAV_STATE
-msg.param1 = 16.0            # NAVIGATION_STATE_FLIP_RECOVERY
-```
+> `10071` 直接给 `nav_state` 数值，不用换算 `custom_mode` 位域。
 
-### 方式 E：命令行 / MAVLink Console
+### D. 板载命令行
 
 ```
 commander mode flip
 ```
 
-## 4. 观测与退出
+## 4. 执行结果回传
+
+翻正结束（成功或失败）后模块持续发布 `flip_recovery_status`，上位机订阅它就能发下一步，
+不用轮询 `nav_state`、不用读日志：
+
+```python
+from px4_msgs.msg import FlipRecoveryStatus
+
+def status_cb(self, msg):
+    if msg.result == FlipRecoveryStatus.RESULT_SUCCESS:
+        # 用时 msg.duration_s，结束倾角 msg.tilt_deg
+        # 下一步：解锁 / 起飞 / 切回 Position
+        pass
+    elif msg.result == FlipRecoveryStatus.RESULT_FAILED:
+        # msg.reason: 1=TIMEOUT 2=NO_PROGRESS 3=SAFETY_LOST 4=MODE_EXITED 5=ATTITUDE_RESET
+        pass
+```
+
+`result` 会一直保持到最后一次结果，直到下次开始出力才回到 `RESULT_NONE`，
+所以上位机要按**跳变**去重（记住上一次的值），或者用 `session_id` 区分不同的尝试。
+
+## 5. 观测与退出
 
 ```
-listener flip_recovery_control      # 倾角、zone、掩码、逐路油门、状态机
-flip_recovery status                # 一次打印全部内部状态
+listener flip_recovery_control      # 倾角、zone、掩码、逐路油门
+listener flip_recovery_status       # 执行结果、时长、失败原因
+flip_recovery status                # 全部内部状态
 ```
 
-正常会看到：
+退出：拨杆拨回 / 在 QGC 切到其它模式 / 翻完自动切回 `FLIP_EXIT_MODE` / `FLIP_EN=0`。
 
-```
-flip state 1: ramping up (tilt 121.3)
-flip zone 2 (tilt 121): HIGH(m0c) reversed @ 0.20 [lifts] | LOW(m03) reversed @ 0.10
-flip state 3: tilt below stop angle, gravity takes over
-flip done, switching back to mode 2
-```
-
-退出方式：拨杆拨回 / 发 `SET_MODE` / 翻完自动切回 `FLIP_EXIT_MODE` / `FLIP_EN=0`。
-
-## 5. DShot 出力层（进行中）
+## 6. DShot 出力层（进行中）
 
 拆成两层：**能不能输出**（软件门控，已完成）和**输出什么方向**（电调能力，待做）。
 
@@ -204,6 +208,7 @@ commander mode flip
 | 文件 | 内容 |
 |---|---|
 | `msg/FlipRecoveryControl.msg` | 控制请求：`state` / `action` / `zone` / 掩码 / `float32[4] control` / `tilt_deg` |
+| `msg/FlipRecoveryStatus.msg` | 执行结果回传：`result` / `reason` / `duration_s` / `mode_active`，给上位机判断何时发下一步 |
 | `src/lib/flip_recovery/FlipPlanner.hpp` | 纯逻辑：倾角、选边、方向映射、状态机、逐路油门 |
 | `src/modules/flip_recovery/` | 模块骨架 + 14 个参数 + 构建配置 |
 | `docs/flip-recovery/` | 完整文档 |

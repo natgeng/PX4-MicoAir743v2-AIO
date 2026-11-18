@@ -166,7 +166,7 @@ void FlipRecovery::Run()
 	// 姿态被外部重置（重定位/切换估计器）时，放弃本次会话
 	if (_planner.state() != flip_recovery::FlipPlanner::State::Idle
 	    && _quat_reset != _attitude.quat_reset_counter) {
-		_planner.fail("attitude reset during recovery");
+		_planner.fail("attitude reset during recovery", flip_recovery::ReasonAttitudeReset);
 	}
 
 	if (_planner.state() == flip_recovery::FlipPlanner::State::Idle
@@ -218,6 +218,21 @@ void FlipRecovery::Run()
 	if (previous != _planner.state()) {
 		PX4_INFO("flip state %u: %s (tilt %.1f)", static_cast<unsigned>(_planner.state()), _planner.reason(),
 			 (double)_tilt);
+
+		// 给上位机的结果：只有 Done 才算成功，Failed 带原因码
+		if (_planner.state() == flip_recovery::FlipPlanner::State::Ramp) {
+			_session_start = now;
+			_result = flip_recovery_status_s::RESULT_NONE;
+			_duration = 0.f;
+
+		} else if (_planner.state() == flip_recovery::FlipPlanner::State::Done) {
+			_result = flip_recovery_status_s::RESULT_SUCCESS;
+			_duration = (_session_start != 0 && now >= _session_start) ? (now - _session_start) * 1e-6f : 0.f;
+
+		} else if (_planner.state() == flip_recovery::FlipPlanner::State::Failed) {
+			_result = flip_recovery_status_s::RESULT_FAILED;
+			_duration = (_session_start != 0 && now >= _session_start) ? (now - _session_start) * 1e-6f : 0.f;
+		}
 	}
 
 	// 工作区切换时打印一次"谁在往哪推"，方便台架上直接核对
@@ -267,6 +282,7 @@ void FlipRecovery::Run()
 	}
 
 	publishControl(_plan, _param_out_direct.get());
+	publishStatus(_plan);
 }
 
 void FlipRecovery::requestExitMode()
@@ -336,6 +352,22 @@ void FlipRecovery::publishControl(const flip_recovery::Plan &plan, bool direct)
 
 		_motors_pub.publish(m);
 	}
+}
+
+// 给上位机的执行结果。上位机订阅本话题，等 result 从 NONE 变成 SUCCESS/FAILED
+// 就可以发下一步（解锁、起飞、切模式…），不需要轮询 nav_state 或翻日志。
+void FlipRecovery::publishStatus(const flip_recovery::Plan &plan)
+{
+	flip_recovery_status_s msg{};
+	msg.timestamp = hrt_absolute_time();
+	msg.session_id = _planner.session();
+	msg.state = plan.state;
+	msg.result = _result;
+	msg.reason = plan.reason_code;
+	msg.tilt_deg = plan.tilt_deg;
+	msg.duration_s = _duration;
+	msg.mode_active = _mode_active;
+	_flip_status_pub.publish(msg);
 }
 
 int FlipRecovery::print_status()

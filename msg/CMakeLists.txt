@@ -92,6 +92,7 @@ set(msg_files
 	FollowTargetEstimator.msg
 	FollowTargetStatus.msg
 	FlipRecoveryControl.msg
+	FlipRecoveryStatus.msg
 	FuelTankStatus.msg
 	FixedWingLateralGuidanceStatus.msg
 	FixedWingLateralStatus.msg

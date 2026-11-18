@@ -83,88 +83,183 @@ param set FLIP_LOW_MODE 1     # 强制正转，看是不是翻不动
 param set FLIP_LOW_MODE 2     # 强制反转
 ```
 
-## 4. 触发方式（任选一种）
+## 4. 触发方式
 
-四条路径最终都落到同一个 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
+四种方式最终都落到 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
+按场景选一种即可，不需要全配。
 
-### 方式 A：遥控器拨杆
+### 方式 A：QGC 参数页（不用写代码）
 
-上面 `COM_FLTMODE5 = 17` 设好后，把模式开关拨到第 5 档即可。
+**第一步：把某个模式槽位指给翻正**
 
-### 方式 B：MAVLink `SET_MODE`（推荐给上位机）
+1. QGC 连接飞控
+2. 左侧 **齿轮图标 → Parameters**
+3. 搜索框输入 `COM_FLTMODE`
+4. 找到 `COM_FLTMODE5`（或任意未使用的槽位），点右侧下拉框
+5. 选 **Flip Recovery**
+6. 点右上角 **Save**
 
-```python
-from pymavlink import mavutil
+> 下拉里能出现 "Flip Recovery"，是因为固件在 `commander/module.yaml` 里把这个枚举描述成
+> `17: Flip Recovery`，QGC 读参数元数据时会显示出来。
+>
+> **注意：QGC 的 "Flight Modes" 页面里没有这个模式** —— 那个页面的模式列表是 QGC 硬编码的，
+> 只包含 PX4 标准模式。必须走 **Parameters** 页面。
 
-master = mavutil.mavlink_connection('udp:127.0.0.1:14550')
-master.wait_heartbeat()
+**第二步：触发**
 
-master.mav.set_mode_send(
-    master.target_system,
-    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-    (12 << 16)          # custom_mode = main_mode(12) << 16 | sub_mode(0)
-)
+| 场景 | 操作 |
+|---|---|
+| 有遥控 | 见方式 B，拨杆切 |
+| 没遥控 / 台架 | QGC → **MAVLink Console** → 输入 `commander mode flip` |
+
+MAVLink Console 位置：QGC 左侧 **齿轮 → MAVLink Console**（部分版本在 "Analyze Tools" 下）。
+
+### 方式 B：遥控器拨杆（日常使用推荐）
+
+**前提：遥控器和开关已校准**
+
+1. QGC → **Vehicle Setup → Radio**
+2. 按提示把摇杆和所有开关拨到两端完成校准
+3. 校准完成后 QGC 会显示每个通道的映射条
+
+**模式槽位与开关档位的对应关系**
+
+| 开关位置 | 对应参数 |
+|---|---|
+| 第 1 档 | `COM_FLTMODE1` |
+| 第 2 档 | `COM_FLTMODE2` |
+| … | … |
+| 第 6 档 | `COM_FLTMODE6` |
+
+按方式 A 的步骤，把想用的那一档设成 **Flip Recovery**。例如：
+
+```
+COM_FLTMODE1 = Position         # 第 1 档：定点
+COM_FLTMODE2 = Altitude         # 第 2 档：定高
+COM_FLTMODE3 = Flip Recovery    # 第 3 档：翻正
 ```
 
-### 方式 C：MAVLink `MAV_CMD_DO_SET_MODE`
+**使用**
 
-```python
-master.mav.command_long_send(
-    master.target_system, master.target_component,
-    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-    1,      # param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-    12,     # param2 = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
-    0,      # param3 = sub_mode
-    0, 0, 0, 0
-)
+拨到第 3 档 → 进入翻正模式；拨回任意其它档 → 立即收油退出。
+
+翻正模式禁止解锁（`mode_req_prevent_arming`），所以误拨之后也不会意外起飞。
+
+**可选：加一路二次确认**
+
+拨杆容易误碰，可以再要求一路开关同时在高位才出力：
+
+```
+param set FLIP_RC_CONFIRM 6    # 要求 aux6 通道在高位
 ```
 
-### 方式 D：uORB 话题（ROS2 / px4_ros2）
+### 方式 C：ROS2 话题（上位机自动流程）
+
+和发"降落"完全同一个套路 —— 都往 `VehicleCommand` 里填 `command`，本功能只多一个 `param1`：
 
 ```python
 from px4_msgs.msg import VehicleCommand
 
-msg = VehicleCommand()
-msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
-msg.command = 176            # VEHICLE_CMD_DO_SET_MODE
-msg.param1 = 1.0             # CUSTOM_MODE_ENABLED
-msg.param2 = 12.0            # PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
-msg.param3 = 0.0
-msg.target_system = 1
-msg.target_component = 1
-msg.source_system = 1
-msg.source_component = 1
-msg.from_external = True
-self.publisher.publish(msg)
+# 对照：发降落
+cmd.command = VehicleCommand.VEHICLE_CMD_NAV_LAND
+
+# 本功能：发翻正
+cmd.command = 10071      # VEHICLE_CMD_SET_NAV_STATE
+cmd.param1  = 16.0       # NAVIGATION_STATE_FLIP_RECOVERY
 ```
 
-更直接的写法（跳过 custom_mode 换算）：
+完整一帧：
 
 ```python
-msg.command = 10071          # VEHICLE_CMD_SET_NAV_STATE
-msg.param1 = 16.0            # NAVIGATION_STATE_FLIP_RECOVERY
+cmd = VehicleCommand()
+cmd.timestamp        = int(self.get_clock().now().nanoseconds / 1000)
+cmd.command          = 10071
+cmd.param1           = 16.0
+cmd.target_system    = 1
+cmd.target_component = 1
+cmd.from_external    = True
+self.cmd_pub.publish(cmd)
 ```
 
-### 方式 E：命令行（台架/MAVLink Console）
+> `10071` 是 PX4 内部的 `VEHICLE_CMD_SET_NAV_STATE`，直接给 `nav_state` 数值，
+> 不用换算 `custom_mode` 位域。
+> 想用标准写法也行：`command = 176`（DO_SET_MODE）+ `param1 = 1` + `param2 = 12`。
+
+### 方式 D：板载命令行
 
 ```
 commander mode flip
 ```
 
-## 5. 退出
+只用于台架调试，或没接 QGC 时通过串口 / nsh 输入。
+
+## 5. 执行结果回传（给上位机）
+
+翻正结束后模块会持续发布 `flip_recovery_status`，上位机订阅它就知道"这一步做完了没有"，
+**不需要轮询 `nav_state`，也不用读日志**。
+
+```
+uint8 state        # IDLE / RAMP / HOLD / COAST / DONE / FAILED
+uint8 result       # NONE / SUCCESS / FAILED
+uint8 reason       # TIMEOUT / NO_PROGRESS / SAFETY_LOST / MODE_EXITED / ATTITUDE_RESET
+float32 tilt_deg   # 结束时的倾角
+float32 duration_s # 从开始出力到结束的时长
+bool mode_active   # 是否仍停留在翻正模式（判断有没有自动切回）
+```
+
+### 上位机用法
+
+```python
+from px4_msgs.msg import FlipRecoveryStatus
+
+def status_cb(self, msg):
+    if msg.result == FlipRecoveryStatus.RESULT_NONE:
+        return                                    # 还在跑，什么都不做
+
+    if msg.result == FlipRecoveryStatus.RESULT_SUCCESS:
+        self.get_logger().info(f"翻正完成，用时 {msg.duration_s:.2f}s，倾角 {msg.tilt_deg:.1f}")
+        # 下一步：解锁 / 起飞 / 切回 Position
+
+    elif msg.result == FlipRecoveryStatus.RESULT_FAILED:
+        self.get_logger().warn(f"翻正失败，原因码 {msg.reason}")
+        # 下一步：重试（需先切出模式再切回）/ 上报
+```
+
+**去重**：`result` 一旦变成 SUCCESS / FAILED 就会一直保持，直到下一次开始出力才回到 NONE。
+所以上位机要记住上一次的 `result`，只在**跳变**时动作：
+
+```python
+if msg.result != self.last_result and msg.result != FlipRecoveryStatus.RESULT_NONE:
+    self.on_flip_finished(msg)
+self.last_result = msg.result
+```
+
+或者用 `session_id` 区分不同的尝试。
+
+### 失败原因码
+
+| reason | 含义 | 常见处理 |
+|---|---|---|
+| `1 TIMEOUT` | 出力超过 `FLIP_TIME` | 调大 `FLIP_TIME` 或 `FLIP_THR_HIGH` |
+| `2 NO_PROGRESS` | 进度检查没通过（选错边 / 方向反 / 推力不足） | 检查 `FLIP_LOW_MODE`、加大 `FLIP_THR_HIGH` |
+| `3 SAFETY_LOST` | 解锁、离地、遥控丢失、`FLIP_EN=0` | 检查现场条件 |
+| `4 MODE_EXITED` | 中途被切出模式 | 正常现象，下次重新进 |
+| `5 ATTITUDE_RESET` | 姿态估计被重置 | 检查 EKF2 |
+
+## 6. 退出
 
 | 方式 | 结果 |
 |---|---|
-| 拨杆拨回 / 发 `SET_MODE` 到任意其它模式 | 下一周期立即收油 |
+| 拨杆拨回 / 在 QGC 切到任意其它模式 | 下一周期立即收油 |
 | 翻正完成或失败 | 自动切回 `FLIP_EXIT_MODE`（默认 Position） |
 | `param set FLIP_EN 0` | 立即停 |
 
-## 6. 观测
+## 7. 观测
 
 ```
-listener flip_recovery_control      # 倾角、zone、掩码、逐路油门、状态机
+listener flip_recovery_control      # 倾角、zone、掩码、逐路油门
+listener flip_recovery_status       # 执行结果、时长、失败原因
 flip_recovery status                # 一次打印全部内部状态
-listener vehicle_status             # 确认 nav_state 是否 = 16
 ```
 
 正常会看到：
@@ -176,9 +271,7 @@ flip state 3: tilt below stop angle, gravity takes over
 flip done, switching back to mode 2
 ```
 
-`[lifts]` = 高位正在把机身抬起来翻过去，`[presses]` = 高位在压回去。
-
-## 7. 安全约束（已内置，不需要你配）
+## 8. 安全约束（已内置，不需要你配）
 
 | 约束 | 实现 |
 |---|---|
@@ -190,8 +283,6 @@ flip done, switching back to mode 2
 | 方向配反自动停 | `FLIP_PROG_T` 内倾角没减小就 `Failed` |
 | 本次失败后必须退出模式才能重试 | `_rearm_needed` |
 | 姿态被重置（切换估计器）立即放弃 | `quat_reset_counter` 变化检测 |
-
----
 
 # 实现原理
 
@@ -389,6 +480,7 @@ control[i] = ±min(_thr, 该组目标油门);
 | 文件 | 内容 |
 |---|---|
 | `msg/FlipRecoveryControl.msg` | 控制请求：`state` / `action` / `zone` / `fwd_mask` / `rev_mask` / `float32[4] control` / `tilt_deg` |
+| `msg/FlipRecoveryStatus.msg` | 执行结果回传：`result`（SUCCESS/FAILED）/ `reason`（5 种失败原因）/ `duration_s` / `mode_active` |
 | `src/lib/flip_recovery/FlipPlanner.hpp` | 纯逻辑：倾角、选边、方向映射、状态机、逐路油门 |
 | `src/modules/flip_recovery/FlipRecovery.hpp` | 模块类：订阅/发布、参数声明 |
 | `src/modules/flip_recovery/FlipRecovery.cpp` | 主循环：取数 → 安全判定 → 调规划器 → 发布 → 收尾切模式 |
@@ -400,7 +492,7 @@ control[i] = ±min(_thr, 该组目标油门);
 | 文件 | 改了什么 | 为什么 |
 |---|---|---|
 | `msg/versioned/VehicleStatus.msg` | `NAVIGATION_STATE_FREE1=16` → `NAVIGATION_STATE_FLIP_RECOVERY=16` | 复用空闲槽位，`MAX` 保持 31，位掩码/ROS2 消息/外部工具零影响 |
-| `msg/CMakeLists.txt` | 注册 `FlipRecoveryControl.msg` | 不注册就不生成头文件 |
+| `msg/CMakeLists.txt` | 注册 `FlipRecoveryControl.msg` 和 `FlipRecoveryStatus.msg` | 不注册就不生成头文件 |
 | `src/modules/commander/px4_custom_mode.h` | 加 `PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY`（=12）；`get_px4_custom_mode()` 加反查 | MAVLink 的 `custom_mode` 字节需要它；反查用于心跳上报 |
 | `src/lib/modes/ui.hpp` | `getValidNavStates()` 加位；`nav_state_names[16]` = "Flip Recovery" | 不加位 → 拨杆切换被判非法；不改名 → OSD 显示 `16: UNUSED2` |
 | `ModeUtil/control_mode.cpp` | 该模式 case 内**所有 flag 保持 false** | `ControlAllocator` 用 `flag_control_allocation_enabled` 决定是否发布 `actuator_motors`，留 false 就等于让位 |
