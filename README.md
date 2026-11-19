@@ -88,7 +88,7 @@ make micoair_h743-v2_default -j$(nproc)
 
 | 分支 | 内容 | 状态 |
 |---|---|---|
-| [`feat/flip-recovery`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/feat/flip-recovery) | 反乌龟 / 侧翻自动纠正（本分支 + 新增飞行模式，含结果回传） | 模式与算法完成，电机反向待接入 |
+| [`feat/flip-recovery`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/feat/flip-recovery) | 反乌龟 / 侧翻自动纠正（本分支 + 新增飞行模式，含结果回传与[实测报告](https://github.com/natgeng/PX4-MicoAir743v2-AIO/blob/feat/flip-recovery/docs/flip-recovery/TEST-REPORT.md)） | 模式/算法/电调换向已验证，驱动时序待接入 |
 | [`main`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/main) | 项目总览：两个分支的入口、参数与使用说明 | 上游 PX4 + 本项目 README |
 
 分支关系：`v1.17.0` -> **本分支** -> `feat/flip-recovery`
