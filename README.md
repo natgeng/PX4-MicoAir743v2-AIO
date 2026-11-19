@@ -10,6 +10,7 @@
 | 飞控 | STM32H743VIH6，BMI088 + BMI270，SPL06 |
 | 电调 | 4 × 35 A **Bluejay 0.19.2**（8-bit SiLabs EFM8） |
 | 固件余量 | app 约 1.9 MB / 上限 1.92 MB，**剩余约 61 KB** |
+| 电调换向 | **4/4 电机支持 DShot 方向命令 20/21**（2026-11-19 实测，见第一节第 8 小节） |
 
 > 注意：45A 版是 **AM32**（32-bit），电调能力和本分支的假设不同。
 > 也不要把第一代 `MicoAir743-AIO-35A`（非 v2，AM32）混进来。
@@ -21,7 +22,7 @@
 | 分支 | 内容 | 状态 |
 |---|---|---|
 | [`fix/bdshot-micoair743v2-aio`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/fix/bdshot-micoair743v2-aio) | 双向 DShot 修复 —— 让本板的 RPM 遥测能用 | 可用 |
-| [`feat/flip-recovery`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/feat/flip-recovery) | 侧翻 / 倒扣自动翻正 —— 新增一个飞行模式 | 模式与算法完成，电机反向待接入 |
+| [`feat/flip-recovery`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/tree/feat/flip-recovery) | 侧翻 / 倒扣自动翻正 —— 新增一个飞行模式 | 模式/算法/电调换向已验证，驱动时序待接入 |
 
 两个分支各自独立编译，都**已包含** `bdshot` 修复。
 
@@ -36,6 +37,7 @@ v1.17.0
 # 一、侧翻自动纠正 flip_recovery
 
 > 完整文档：[`docs/flip-recovery/README.md`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/blob/feat/flip-recovery/docs/flip-recovery/README.md)
+> 实测报告：[`docs/flip-recovery/TEST-REPORT.md`](https://github.com/natgeng/PX4-MicoAir743v2-AIO/blob/feat/flip-recovery/docs/flip-recovery/TEST-REPORT.md)
 
 ## 它做什么
 
@@ -175,9 +177,27 @@ flip_recovery status                # 全部内部状态
 
 ### 7. 当前限制
 
-- **桨能转，但方向只有出厂方向** —— DShot 反向（命令 20/21）还没接入。
-  Bluejay 0.19.2 官方支持命令 21（turtle mode），所以预期可行，但需要真机确认。
+- **桨能转，但方向只有出厂方向** —— DShot 反向的命令通路已验证（见下），
+  但驱动层的「停机 → 发方向命令 → 再给油门」时序还没接进 `DShot.cpp`。
 - 只支持 Quad-X（`CA_ROTOR_COUNT = 4`）。
+
+### 8. 电调换向：已实测确认（2026-11-19）
+
+在这块板子（v2-AIO-35A，Bluejay 0.19.2）上拆桨实测，**4/4 电机都能反向并立即恢复**：
+
+| 电机 | 正常方向 | `dshot reverse` 后 | 正常转向（俯视） |
+|---|---|---|---|
+| 1 | +233 | −267 | 逆时针 |
+| 2 | +271 | −328 | 逆时针 |
+| 3 | −349 | +275 | 顺时针 |
+| 4 | −290 | +202 | 顺时针 |
+
+数值是无桨时起步的机身反作用角速度 `zgyro`（mrad/s），符号即转向——无桨电机肉眼难辨，
+BSHOT 遥测关闭，所以用机身反力矩做客观测量。方法、原始波形和两种失败的测量方案见
+[测试报告](https://github.com/natgeng/PX4-MicoAir743v2-AIO/blob/feat/flip-recovery/docs/flip-recovery/TEST-REPORT.md)。
+
+顺带确认：**电机编号与 PX4 标准 Quad-X 一致**（1/2 同向、3/4 同向且相反），
+翻正算法用 `CA_ROTORn_PX/PY` 选边不会错位。
 
 ---
 
