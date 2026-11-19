@@ -1,0 +1,3238 @@
+diff --git a/boards/micoair/h743-v2/default.px4board b/boards/micoair/h743-v2/default.px4board
+index 9f6d00a5d0..2a61b77cf9 100644
+--- a/boards/micoair/h743-v2/default.px4board
++++ b/boards/micoair/h743-v2/default.px4board
+@@ -55,6 +55,7 @@ CONFIG_MODULES_EKF2=y
+ CONFIG_MODULES_ESC_BATTERY=y
+ CONFIG_MODULES_EVENTS=y
+ CONFIG_MODULES_FLIGHT_MODE_MANAGER=y
++CONFIG_MODULES_FLIP_RECOVERY=y
+ CONFIG_MODULES_FW_ATT_CONTROL=y
+ CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL=y
+ CONFIG_MODULES_FW_POS_CONTROL=y
+diff --git a/boards/micoair/h743-v2/init/rc.board_extras b/boards/micoair/h743-v2/init/rc.board_extras
+index e7653077db..f0f12d3f68 100644
+--- a/boards/micoair/h743-v2/init/rc.board_extras
++++ b/boards/micoair/h743-v2/init/rc.board_extras
+@@ -5,3 +5,9 @@
+ 
+ # enable onboard OSD chip
+ # atxxxx start -s
++
++# 倾角翻正：模块常驻（20ms 周期，开销可忽略）。
++# 是否真出力由 FLIP_EN 和 FLIP_RECOVERY 模式共同决定：
++#   FLIP_EN=0        -> 拨进模式也不转桨，只报状态
++#   FLIP_EN=1 + 模式 -> 按倾角自动翻正
++flip_recovery start
+diff --git a/docs/flip-recovery/IMPLEMENTATION.md b/docs/flip-recovery/IMPLEMENTATION.md
+new file mode 100644
+index 0000000000..33644f323f
+--- /dev/null
++++ b/docs/flip-recovery/IMPLEMENTATION.md
+@@ -0,0 +1,732 @@
++# 倾角翻正 flip_recovery —— 实现说明 v2（模式化版本）
++
++> 基线：PX4 v1.17.0（`d6f12ad1c4f70ad3230afd7d86e971421e02fef4`）
++> 目标板：MicoAir743v2-AIO-35A（`micoair_h743-v2`）
++> 本版本相对 v1 的唯一结构性变化：**触发方式从「AUX 开关电平」改为「飞行模式」**，
++> 拨杆、上位机话题、MAVLink、命令行四条路径统一落到同一个 `nav_state`。
++
++---
++
++## 0. 一句话说清楚它现在怎么工作
++
++```
++遥控拨杆 ──┐
++MAVLink ───┤
++vehicle_cmd┼──► Commander ──► vehicle_status.nav_state = FLIP_RECOVERY(16)
++CLI ───────┘                          │
++                                      ▼
++                          flip_recovery 模块被唤醒
++                                      │
++              IMU → EKF2 → 四元数 → 倾角 → 选低位桨 → 正/反转掩码
++                                      │
++                                      ▼
++                        flip_recovery_control（+ 可选 actuator_motors）
++```
++
++模式本身不产生推力；它只是「允许翻正」的许可。是否出力还叠加 `FLIP_EN`、未解锁、落地、
++姿态有效、可选遥控二次确认这几道闸门。
++
++---
++
++## 1. 改动清单（每一处 + 为什么）
++
++### 1.1 模式槽位：`msg/versioned/VehicleStatus.msg`
++
++```diff
++-uint8 NAVIGATION_STATE_FREE1 = 16
+++uint8 NAVIGATION_STATE_FLIP_RECOVERY = 16      # Tilt flip recovery (reuses the former FREE1 slot)
++```
++
++**为什么用 16 而不是新增 31：**
++
++| 方案 | 影响 |
++|---|---|
++| 新增 `= 31` 并把 `MAX` 改成 32 | 需要动 `static_assert(NAVIGATION_STATE_MAX == 31)`，至少 4 个文件；`nav_state_names[]` 数组长度变化；ROS2 `px4_msgs` 需要同步；`uint32` 的 `valid_nav_states_mask` 刚好能放 32 位，再多就溢出 |
++| **复用 FREE1 = 16**（本方案） | 数值不变、`MAX` 不变、位掩码不变、外部工具零改动；`FREE1` 全仓库只在消息定义里出现，没有任何代码引用 |
++
++PX4 官方把 7/9/11/16 留成 `FREE*`，本来就是给这类内部扩展用的。
++
++### 1.2 自定义模式号：`src/modules/commander/px4_custom_mode.h`
++
++```diff
++ 	PX4_CUSTOM_MAIN_MODE_TERMINATION,
++ 	PX4_CUSTOM_MAIN_MODE_ALTITUDE_CRUISE,
+++	PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY /* 12: tilt flip recovery */
++ };
++```
++
++```diff
++ 	case vehicle_status_s::NAVIGATION_STATE_STAB:
++ 		custom_mode.main_mode = PX4_CUSTOM_MAIN_MODE_STABILIZED;
++ 		break;
++ 
+++	case vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY:
+++		custom_mode.main_mode = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY;
+++		break;
++```
++
++**为什么：** `PX4_CUSTOM_MAIN_MODE_*` 是 MAVLink 的 `custom_mode.main_mode` 字节，
++上位机 QGC / MAVSDK / pymavlink 发 `SET_MODE` 时填的就是它。
++现有枚举到 `ALTITUDE_CRUISE = 11`，所以新值自然是 **12**。
++第二个改动是反向映射（`nav_state → custom_mode`），MAVLink 上报心跳时用它，
++不做的话地面站只会看到 `UNKNOWN`。
++
++### 1.3 模式合法性：`src/lib/modes/ui.hpp`
++
++```diff
++ 	       (1u << vehicle_status_s::NAVIGATION_STATE_AUTO_VTOL_TAKEOFF) |
+++	       (1u << vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY);
++```
++
++```diff
++ 	"Stabilized",
++-	"16: UNUSED2",
+++	"Flip Recovery",
++ 	"Takeoff",
++```
++
++**为什么：** `getValidNavStates()` 生成的位掩码会进 `vehicle_status.valid_nav_states_mask`，
++`ModeManagement::getModeStatus()` 用它决定「这个模式能不能被选中」。
++不加这一位，拨杆切过去会被直接判为非法模式并拒绝。
++`nav_state_names[]` 是日志 / OSD / MAVLink 的显示名，不改就是 `16: UNUSED2`。
++
++### 1.4 控制模式：`src/modules/commander/ModeUtil/control_mode.cpp`
++
++```diff
++ 	case vehicle_status_s::NAVIGATION_STATE_STAB:
++ 		vehicle_control_mode.flag_control_manual_enabled = true;
++ 		...
++ 		vehicle_control_mode.flag_control_allocation_enabled = true;
++ 		break;
++ 
+++	case vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY:
+++		// 翻正模式不使用任何控制器：所有 flag 保持 false。
+++		// 电机输出由 flip_recovery 模块独占（control_allocator 在该模式下让位），
+++		// 因此这里既不置 attitude/rate，也不置 allocation。
+++		break;
++```
++
++**这是整个模式化里最关键的一处。** 原因链：
++
++1. `Commander::updateControlMode()` 每周期先 `_vehicle_control_mode = {}` 再调这个函数；
++2. `ControlAllocator.cpp:372` 有 `_publish_controls = vehicle_control_mode.flag_control_allocation_enabled;`
++3. `ControlAllocator::publish_actuator_controls()` 开头 `if (!_publish_controls) return;`
++
++所以把 `flag_control_allocation_enabled` 留成 `false`，就等于让 control_allocator
++**主动闭嘴**，不再发布 `actuator_motors`。
++这样 flip_recovery 发布 `actuator_motors` 时才不会和分配器抢同一个 topic
++（uORB 是「后写覆盖」，两个模块同时发会打架）。
++
++同时不置 `attitude/rates/position` 等 flag，保证 `flight_mode_manager`、
++`mc_att_control`、`mc_pos_control` 全部不启动，不会有控制器在地面上试图「稳住姿态」。
++
++### 1.5 模式依赖：`src/modules/commander/ModeUtil/mode_requirements.cpp`
++
++```diff
+++	// NAVIGATION_STATE_FLIP_RECOVERY
+++	// 需要姿态 + 角速度才能算倾角和电机相对地面高度；需要遥控以便随时拨杆退出。
+++	// mode_req_prevent_arming：该模式只允许在地面未解锁时使用，绝不允许带着翻正模式起飞。
+++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_angular_velocity);
+++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_attitude);
+++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_manual_control);
+++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_prevent_arming);
++```
++
++**为什么逐条：**
++
++| flag | 作用 | 不加会怎样 |
++|---|---|---|
++| `mode_req_attitude` | 没姿态估计就不允许运行 | 估计器还没收敛时可能用垃圾四元数算倾角 |
++| `mode_req_angular_velocity` | 同上，陀螺必须在线 | 无法判断是不是在剧烈翻滚 |
++| `mode_req_manual_control` | 遥控链路必须存在 | 拨进去后如果 RC 掉了，没有任何手段退出（只能断电） |
++| `mode_req_prevent_arming` | **本模式下禁止解锁** | 最危险：用户可能带着翻正模式解锁起飞，四个桨按反乌龟逻辑乱转 |
++
++`mode_req_prevent_arming` 的效果由 `HealthAndArmingChecks` 读取
++（`modePreventsArming(nav_state)` 查的就是这个位），解锁时会直接报
++"mode not suitable for arming"。
++
++> 注意：`mode_req_*` 只在 **armed 之后** 才参与 failsafe 判定，
++> disarmed 时 `UserModeIntention::change()` 是无条件放行的，
++> 所以「没接遥控、纯上位机」也能切进这个模式。
++
++### 1.6 命令解析：`src/modules/commander/Commander.cpp`
++
++```diff
++ 				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_STABILIZED) {
++ 					desired_nav_state = vehicle_status_s::NAVIGATION_STATE_STAB;
++ 
+++				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY) {
+++					desired_nav_state = vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY;
+++
++ 				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD) {
++```
++
++**为什么：** 这是 `VEHICLE_CMD_DO_SET_MODE` 的唯一解析点。
++MAVLink `SET_MODE`、`MAV_CMD_DO_SET_MODE`、ROS2 `px4_ros2` 的 `setMode`、
++以及本模块翻正结束后自动切回模式，全部走这里。不加就一律 `TRANSITION_DENIED`。
++
++```diff
++ 			} else if (!strcmp(argv[1], "stabilized")) {
++ 				send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_STABILIZED);
++ 
+++			} else if (!strcmp(argv[1], "flip")) {
+++				// 倾角翻正模式：与遥控拨杆、MAVLink SET_MODE 走同一条路径
+++				send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY);
++```
++
++**为什么：** 台架调试最方便的一条路 —— `commander mode flip` 不用开地面站。
++它和拨杆走的是同一条命令链路，不会出现「CLI 能用但拨杆不行」的分裂。
++
++```diff
++-	PRINT_MODULE_USAGE_ARG("manual|acro|offboard|stabilized|altctl|...",
+++	PRINT_MODULE_USAGE_ARG("manual|acro|offboard|stabilized|flip|altctl|...",
++```
++
++只是 usage 文本，方便 `commander` 回车时能看到。
++
++### 1.7 拨杆映射：`src/modules/manual_control/ManualControl.cpp`
++
++```diff
++ 		case 16: return vehicle_status_s::NAVIGATION_STATE_ALTITUDE_CRUISE;
+++		case 17: return vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY;
++```
++
++**为什么：** PX4 1.16 起把遥控模式切换从 commander 拆到了独立的 `manual_control` 模块。
++完整链路是：
++
++```
++RC 模式通道 → manual_control_switches.mode_slot (1..6)
++            → ManualControl::evaluateModeSlot()
++            → navStateFromParam(COM_FLTMODE<n>)
++            → action_request{ACTION_SWITCH_MODE, mode=nav_state}
++            → Commander::handle_action_request()
++            → _user_mode_intention.change()
++```
++
++`navStateFromParam()` 的 case 值 = `COM_FLTMODE` 的 enum 值。
++所以拨杆要能切进翻正，**必须同时改这里和 `module.yaml`**，漏一个就失效。
++
++### 1.8 参数枚举：`src/modules/commander/module.yaml`
++
++```diff
++                 16: Altitude Cruise
+++                17: Flip Recovery
++```
++
++**为什么：** 这是 QGC 参数页里 `COM_FLTMODE1..6` 的下拉选项。
++没有它，用户只能手填数字 17，且 QGC 会把它显示成非法值。
++`module.yaml` 是 PX4 1.16+ 的新参数描述系统，编译时生成参数元数据。
++
++### 1.9 板级配置：`boards/micoair/h743-v2/default.px4board`
++
++```diff
++ CONFIG_MODULES_FLIGHT_MODE_MANAGER=y
+++CONFIG_MODULES_FLIP_RECOVERY=y
++```
++
++编译进固件。不加这个 Kconfig 开关，源码在树里但根本不会被编译。
++
++### 1.10 启动脚本：`boards/micoair/h743-v2/init/rc.board_extras`
++
++```diff
++-# 倾角翻正：只有显式打开 FLIP_EN 才启动，避免默认占用 CPU
++-if param compare FLIP_EN 1
++-then
++-	flip_recovery start
++-fi
+++# 倾角翻正：模块常驻（20ms 周期，开销可忽略）。
+++# 是否真出力由 FLIP_EN 和 FLIP_RECOVERY 模式共同决定
+++flip_recovery start
++```
++
++**为什么改：** v1 是「`FLIP_EN=1` 才启动」。模式化之后如果还这样，
++用户把参数改成 1 必须**重启飞控**模块才会起来，拨杆切进去毫无反应，体验极差。
++现在模块常驻，`FLIP_EN` 退化成「出不出力」的软开关：
++- `FLIP_EN=0`：可以拨进模式，能看倾角/掩码（调试友好），但桨不转；
++- `FLIP_EN=1`：正常翻正。
++
++20 ms 周期 + 6 个订阅，实测 CPU 占用在 0.1% 量级。
++
++### 1.11 消息定义：`msg/FlipRecoveryControl.msg`（重写）
++
++```diff
++ uint8 ACTION_STOP = 0
++ uint8 ACTION_DRIVE = 1
++ ...
+++uint8 STATE_IDLE = 0
+++uint8 STATE_RAMP = 1
+++uint8 STATE_HOLD = 2
+++uint8 STATE_COAST = 3
+++uint8 STATE_DONE = 4
+++uint8 STATE_FAILED = 5
+++
+++uint8 state
++ uint8 action
++ uint8 zone
++ uint8 fwd_mask
++ uint8 rev_mask
++ float32 thr_fwd
++ float32 thr_rev
+++float32 tilt_deg
++```
++
++**为什么加 `state` 和 `tilt_deg`：** 模式化之后，地面站/上位机需要在**不接串口**
++的情况下判断「现在翻到哪一步了」。加这两个字段后，`listener flip_recovery_control`
++或者 ROS2 订阅一条话题就能画出倾角曲线和状态迁移，不用 ssh 进飞控。
++`state` 的数值与 `FlipPlanner::State` 枚举一一对应，零转换。
++
++### 1.12 新增：`src/lib/flip_recovery/FlipPlanner.hpp`
++
++纯逻辑，不依赖 uORB，可以拿 gtest 直接跑。详见第 3 节。
++
++**相对 v1 的三处改动：**
++
++| v1 | v2 | 原因 |
++|---|---|---|
++| `Input.switch_high` | `Input.mode_active` | 触发源从 AUX 电平换成模式 |
++| `_off_seen` 回差（必须先 OFF 再 ON） | 删除，改用 `_rearm_needed` | 模式切换天然是边沿，不需要人为回差；改为「Done/Failed 后必须退出模式再进」 |
++| 无 | `Plan.state` | 把状态机状态透出到 uORB，供观测 |
++| 两组同油门 | **高位 `FLIP_THR_HIGH` + 低位 `FLIP_THR_LOW`** | 转轴是贴地棱，低位在轴上力臂≈0，必须靠高位出力 |
++| 无 | `Settings.thr_high` / `thr_low` / `low_mode` | 高位、低位油门独立可调；低位还能强制正/反转或直接关掉 |
++
++### 1.13 新增：`src/modules/flip_recovery/FlipRecovery.{hpp,cpp}`
++
++**相对 v1 的改动：**
++
++| v1 | v2 | 原因 |
++|---|---|---|
++| `FLIP_AUX` 电平触发 | 订阅 `vehicle_status.nav_state` | 模式化 |
++| `_switch_high` | `_mode_active` | 同上 |
++| 无 | `_param_rc_confirm`（0=不需要） | 拨杆容易误碰，保留一路 AUX 做二次确认的选项 |
++| 无 | `_param_exit_mode` + `requestExitMode()` | 翻完自动切回 Position/Acro 等，不用用户再拨一次 |
++| 无条件要求 RC 有效 | 有 RC 才检查油门最低 | 纯上位机场景（无遥控）也要能用 |
++| 要求 `!failsafe` | 去掉 | 无遥控时 failsafe 常亮，但未解锁本来就飞不起来，安全性由 armed 保证 |
++
++### 1.14 新增：`src/modules/flip_recovery/flip_recovery_params.c`
++
++参数从 12 个变成 14 个：删 `FLIP_AUX`、`FLIP_THR_FWD/REV`、`FLIP_AUX_SCALE`，加 `FLIP_RC_CONFIRM`、`FLIP_EXIT_MODE`、`FLIP_THR_HIGH`、`FLIP_THR_LOW`、`FLIP_LOW_MODE`。
++
++---
++
++## 2. 模式触发的三条路径（都能用）
++
++### 2.1 遥控器拨杆（推荐）
++
++```
++QGC → 参数 → COM_FLTMODE5 = 17 (Flip Recovery)
++```
++
++假设你的模式通道是 6 档，第 5 档就变成翻正开关。
++拨进去 → `nav_state = 16` → 模块开始工作；拨出来 → 立即收油。
++
++### 2.2 上位机话题（uORB / ROS2）
++
++**方式 A：标准 MAVLink SET_MODE**
++
++```python
++# pymavlink
++master.mav.set_mode_send(
++    master.target_system,
++    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
++    (12 << 16)   # custom_mode = main_mode(12) << 16 | sub_mode(0)
++)
++```
++
++**方式 B：MAV_CMD_DO_SET_MODE**
++
++```python
++master.mav.command_long_send(
++    master.target_system, master.target_component,
++    mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
++    1,    # param1 = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
++    12,   # param2 = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY
++    0, 0, 0, 0, 0)
++```
++
++**方式 C：直接发 uORB 话题（ROS2 / px4_ros2）**
++
++```python
++# 方式 C-1：VEHICLE_CMD_SET_NAV_STATE，直接给 nav_state 数值（ROS 专用后门）
++cmd.command = 10071          # VEHICLE_CMD_SET_NAV_STATE
++cmd.param1  = 16.0           # NAVIGATION_STATE_FLIP_RECOVERY
++
++# 方式 C-2：VEHICLE_CMD_DO_SET_MODE
++cmd.command = 176            # VEHICLE_CMD_DO_SET_MODE
++cmd.param1  = 1.0
++cmd.param2  = 12.0
++cmd.param3  = 0.0
++```
++
++三条方式最终都进 `Commander::handle_command()`，结果完全一致。
++
++### 2.3 命令行（台架）
++
++```
++commander mode flip
++```
++
++---
++
++## 3. 从 IMU 到翻正完成的完整算法
++
++### 3.1 数据链路（谁产生四元数）
++
++```
++BMI088 / BMI270 (SPI, 1 kHz)
++        │  sensor_accel / sensor_gyro / sensor_temp
++        ▼
++sensors 模块 ──── 校准（bias / scale）、温度补偿、低通
++        │  sensor_combined
++        ▼
++vehicle_imu（多 IMU 聚合、时间对齐）
++        │
++        ├─► EKF2：状态 [p, v, q, bg, ba, ...]，15 维
++        │      - 陀螺积分得姿态预测
++        │      - 加速度计重力方向做观测更新（静止时权重最高）
++        │      - 磁力计（若有）修正航向
++        │      - 输出：vehicle_attitude.q（四元数，NED 机体系→世界系）
++        │
++        └─► vehicle_angular_velocity（原始角速率，用来判断是否在翻滚）
++
++        ▼
++flip_recovery 每 20 ms 读一次 vehicle_attitude.q
++```
++
++**为什么用 EKF2 的四元数而不是直接读加速度计？**
++加速度计测的是「比力」，静止时正好等于 −重力，可以算倾角；但翻正过程中机身
++在转动，存在线加速度和振动，直接 atan2 出来会抖十几度。EKF2 已经把陀螺积分
++和加速度观测融合过，输出的 `q` 平滑且延迟约 5~10 ms，足够 20 ms 的控制周期。
++
++### 3.2 第一步：四元数 → 倾角（不用欧拉角）
++
++```cpp
++// FlipPlanner::tiltDegrees()
++matrix::Quatf attitude{q};
++if (!std::isfinite(norm) || fabsf(norm - 1.f) > 0.02f) return false;  // 模长异常直接丢弃
++attitude.normalize();
++alignment = matrix::Dcmf{attitude}(2, 2);   // R(2,2)
++```
++
++`R(2,2)` 的含义：机体系 Z 轴（也就是机体「向上」方向）在世界系 Z 轴（天）上的投影。
++
++- 正立：机体 Z 朝上 → `R(2,2) = +1` → `tilt = 0°`
++- 侧躺：机体 Z 水平 → `R(2,2) = 0` → `tilt = 90°`
++- 完全倒扣：机体 Z 朝下 → `R(2,2) = −1` → `tilt = 180°`
++
++`tilt = acos(clamp(R(2,2), -1, 1))`。
++
++**为什么不用 `roll/pitch` 欧拉角：**
++1. 万向锁：pitch = ±90° 时 roll 无定义，而 90° 恰好是我们最关心的分界点；
++2. 欧拉角需要两次三角函数 + 一次 atan2，且 roll/pitch 的组合不能直接给出"总倾角"
++   （pitch 90° + roll 90° 的总倾角不是 127°）；
++3. `R(2,2)` 一步到位，且对 0°/180° 附近数值稳定。
++
++### 3.3 第二步：算四路电机的「世界高度」
++
++```cpp
++// FlipPlanner::lowestPair()
++h[i] = R(2,0) * layout.px[i] + R(2,1) * layout.py[i];
++```
++
++`layout.px[i] / py[i]` 来自 PX4 自己的几何参数：
++`CA_ROTOR_COUNT`、`CA_ROTOR0..3_PX/PY`（机体坐标，前 +X，右 +Y，单位 m）。
++
++`R(2,0)` 是机体系 X 轴在世界 Z 上的投影，`R(2,1)` 是 Y 轴的投影。
++所以 `h[i]` 就是「电机 i 相对重心的竖直高度」，负数 = 贴地。
++
++把 4 个 h 排序，最小的两个 = **低位组（low）**，剩下两个 = **高位组（high）**。
++
++**为什么要选最低两路？** 因为「最低两路的连线」就是翻正的**瞬时转轴**。
++倾斜的机身落地时，是两个低位电机 + 机架接触地面，机身绕这条贴地的棱转动：
++
++```
++        高位组（悬空，力臂 = 轴距，最大）
++       ●───────────●
++       │           │
++       │     CG    │
++       ●───────────●
++     ═════════════════════   ← 地面
++        低位组（在转轴上，力臂 ≈ 0）
++```
++
++由此得到两条结论，直接决定了出力策略：
++
++1. **主攻必须是高位桨**。低位电机在转轴上，力臂约等于 0，给它加油门几乎不产生力矩，
++   只会白耗电、让低位桨贴地打桨；高位电机离转轴最远，同样的推力能产生最大扭矩。
++2. **低位桨只能当辅助**。给它一点反向推力可以减轻地面摩擦、防止低位桨叶直接顶在地上，
++   但绝不能让它当主力。
++
++> 早期版本这里写成了「抬最低两路力臂最短、最省力」，是错的 —— 说反了。
++> 现在已经改为「高位主攻 + 低位辅助」，两个油门 `FLIP_THR_HIGH` / `FLIP_THR_LOW` 完全独立。
++
++这套判定和 LLJ5 的固定「右翻」不同：LLJ5 只往右翻，我们是「哪边高压哪边」，
++任何侧翻方向都能处理。
++
++### 3.4 第三步：两个方向 + 两种策略
++
++**先分清两个 180° 相反的力**：
++
++| 概念 | 含义 | 关系 |
++|---|---|---|
++| **桨对空气** | 螺旋桨把空气往哪甩 | — |
++| **机身受力 `Push`** | 空气对机身的反作用力 | **永远与桨对空气相反** |
++| **电机转向** | `Normal` 出厂 / `Reversed` 反着转 | 决定桨对空气沿机体 ±Z |
++
++正常飞行（tilt=0）：桨**朝下**甩空气 → 机身受力**朝上**（升力）。这是 `Normal` 的定义基准。
++
++| 倾角 | `R(2,2)=cos θ` | 机体 −Z 指向 | `Normal` 桨对空气 | `Normal` 机身受力 |
++|---|---|---|---|---|
++| 60–90° | `> 0` | 朝下偏侧 | 朝下 | **朝上** |
++| 90–180° | `< 0` | 朝上偏侧 | **朝上** | **朝下** |
++
++#### 两组的分工不一样，不能用同一套逻辑套
++
++| 组 | 位置 | 力臂 | 职责 | 油门 |
++|---|---|---|---|---|
++| **高位** | 离转轴最远 | 最大 | **唯一产生翻正力矩的组** | 全额，永远是主攻 |
++| **低位** | 就在转轴上 | ≈ 0 | **卸压**：把机身抬一点，减小地面正压力与绕轴摩擦 | `FLIP_THR_LOW` 独立设定 |
++
++低位为什么不参与产生力矩：它在转轴上，力臂≈0，推力再大也几乎不产生力矩。
++它真正的价值在**摩擦**：
++
++| 低位电机 | 机身受力 | 地面正压力 | 后果 |
++|---|---|---|---|
++| 正转（90–180°） | 朝下 | 增大 | 支点被压死 → 摩擦锁住转轴 → **拖累高位** |
++| 反转（90–180°） | 朝上 | 减小 | 支点"浮"起来 → 摩擦小 → 高位转得动 |
++
++所以低位组的目标恒定：**永远 `Push::Up`（抬）**，只是 90° 前后"抬"对应不同电机转向。
++
++#### 策略 A「翻过去」（`FLIP_MODE=0`，默认）：高位全程反转
++
++| 倾角 | 高位：机身受力 | 高位电机 | 低位：机身受力 | 低位电机 | 净效果 |
++|---|---|---|---|---|---|
++| **60–90°** | 朝下（压回正） | **Reversed** | 朝上（卸压） | **Normal** | tilt 减小，回正 |
++| **90–180°** | 朝上（**抬，翻过去**） | **Reversed** | 朝上（卸压） | **Reversed** | tilt 增大，翻过 180° |
++
++高位电机在 90° 处**不换向**；低位从 Normal 换成 Reversed（因为它要一直"抬"）。
++
++#### 策略 B「压回去」（`FLIP_MODE=1`）：高位全程 Push::Down
++
++| 倾角 | 高位 | 低位 | 净效果 |
++|---|---|---|---|
++| **60–90°** | Reversed（压） | Normal（抬） | tilt 减小 |
++| **90–180°** | **Normal**（压） | **Reversed**（抬） | tilt 减小 |
++
++始终朝 0° 拉，路径最短，但高位在 90° 处要换向。
++
++#### 换算代码
++
++```cpp
++const bool normal_is_up = (R(2, 2) > 0.f);          // Normal 的机身受力是否朝上
++
++Push high_push = Push::Down;                         // 默认压回去
++if (zone == Zone::Inverted && strategy == FlipOver) {
++    high_push = Push::Up;                            // 90~180 翻过去：抬高位
++}
++const Push low_push = Push::Up;                      // 低位恒为"抬"（卸压/减摩擦）
++
++const bool high_normal = ((high_push == Push::Up) == normal_is_up);
++const bool low_normal  = ((low_push  == Push::Up) == normal_is_up);
++```
++
++#### 120° 算例（策略 A）
++
++```
++R(2,0) = -0.866    R(2,2) = cos120° = -0.5  ->  normal_is_up = false
++```
++
++| 组 | 目标受力 | 换算转向 | 桨对空气 | 作用 |
++|---|---|---|---|---|
++| 高位（后两路） | `Push::Up` | **Reversed** | 朝下 → 机身被抬 | 产生翻正力矩（+X），tilt 增大 |
++| 低位（前两路） | `Push::Up` | **Reversed** | 朝下 → 机身被抬 | 力臂≈0，只负责卸压减摩擦 |
++| ❌ 低位改 Normal | `Push::Down` | — | 机身被压 | 支点压死，摩擦锁轴，拖累高位 |
++
++#### 代价对比
++
++| 策略 | 90–120° 段要转过的角度 | 优点 |
++|---|---|---|
++| **翻过去** | 240–270° | 高位转向固定，驱动最简单；过 180° 后重力帮忙 |
++| **压回去** | 90–120° | 90° 附近路径最短 |
++
++### 3.5 第四步：油门斜坡（防止电流冲击）
++
++```cpp
++target = min(max(fwd_mask ? thr_fwd : 0, rev_mask ? thr_rev : 0), 0.60);
++_thr = min(target, _thr + slew * dt);   // slew 默认 0.5/s，dt = 20ms
++```
++
++从 0 线性升到目标值。默认主攻 0.20、辅助 0.20×0.5 = 0.10，上升率 0.5/s → 0.4 s 到顶。
++**为什么要斜坡：** 电调从 0 直接跳到 20% 会产生很大电流尖峰，容易触发低压保护；
++且突然的扭矩会让机身「弹」一下，反而打乱姿态估计。
++
++硬上限 `HARD_MAX_THROTTLE = 0.60` 写死在代码里，参数怎么填都超不过去。
++
++### 3.6 第五步：状态机
++
++```
++        ┌──────────────────────────────────────────────┐
++        │                                              │
++   Idle ─┤ mode_active && safe && tilt ≥ entry_angle   │
++        ▼                                              │
++      Ramp ──(油门到目标)──► Hold ──(tilt ≤ stop)──► Coast ──(稳定/1.5s)──► Done
++        │                     │                                            │
++        │                     └─(超时 / 无进度)──► Failed                  │
++        └─(安全丢失 / 模式退出)──────────────────► Failed                  │
++                                                                           │
++   Done / Failed 后置 _rearm_needed，必须退出模式再进才能重试 ◄────────────┘
++```
++
++**三个退出条件：**
++
++| 条件 | 判据 | 含义 |
++|---|---|---|
++| 成功收油 | `tilt ≤ stop_angle`（默认 60°） | 已经足够正，交给重力 |
++| 超时 | 出力时间 > `FLIP_TIME`（3 s） | 电机/电调过热保护 |
++| 无进度 | 0.8 s 内倾角减少 < 3° | 选错边、推力不够、或者被卡住了 |
++
++「无进度」这一条很重要：如果电机方向配反了，倾角会**增大**而不是减小，
++0.8 s 内就能发现并停机，不会一直顶着把机身推飞。
++
++### 3.7 第六步：发布与执行
++
++```cpp
++flip_recovery_control_s msg;
++msg.state    = 状态机状态;
++msg.action   = driving ? ACTION_DRIVE : ACTION_STOP;
++msg.zone     = ZONE_UPRIGHT / ZONE_INVERTED / ZONE_OFF;
++msg.fwd_mask = control[i] > 0 的电机位掩码（bit0 = Motor1）;
++msg.rev_mask = control[i] < 0 的电机位掩码;
++msg.control[i] = 逐路带符号油门：+ = Normal，- = Reversed，0 = 停;
++msg.tilt_deg = 当前倾角;
++```
++
++**为什么必须逐路给而不是「正转组/反转组两个油门」：**
++
++策略 A 的 90~180° 段，高位和低位**同为 Reversed**，但油门不同（高位 0.20 全额、低位 0.10 打折）。
++单一 `thr_rev` 无法同时表达这两个值，必须退回逐电机粒度。
++
++典型输出（`FLIP_THR_HIGH = 0.20`、`FLIP_THR_LOW = 0.10`、`FLIP_LOW_MODE = 0`）：
++
++| 倾角 | 策略 | 高位 | 低位 |
++|---|---|---|---|
++| 70° | 0 | Reversed 0.20 | Normal 0.10 |
++| 85° | 0 | Reversed 0.20 | Normal 0.10 |
++| 95° | 0 | Reversed 0.20 | **Reversed 0.10** |
++| 120° | 0 | Reversed 0.20 | **Reversed 0.10** |
++| 160° | 0 | Reversed 0.20 | **Reversed 0.10** |
++| 120° | 1 | Normal 0.20 | Reversed 0.10 |
++
++策略 0 下高位**全程 Reversed**，只有低位在 90° 处从 Normal 换成 Reversed。
++
++`mask` 的位序与 `CA_ROTORn` 序号一致，也就是 PX4 的 Motor1..Motor4。
++不需要另外维护「电机号→方位」的映射表 —— 因为方位本来就是从
++`CA_ROTORn_PX/PY` 读出来的，两者天然对齐。
++
++### 3.8 第七步：结束后自动切回
++
++`Done` 或 `Failed` 且仍停留在翻正模式时，发一条
++`VEHICLE_CMD_DO_SET_MODE(param1=1, param2=main_mode(FLIP_EXIT_MODE), param3=sub_mode)`。
++
++默认切回 **Position**（`FLIP_EXIT_MODE=2`）。用户不用再拨一次杆。
++`_exit_requested` 保证一条命令只发一次，避免刷屏。
++
++---
++
++## 4. 参数表
++
++| 参数 | 默认 | 单位 | 说明 |
++|---|---|---|---|
++| `FLIP_EN` | 0 | — | 总开关。0 = 拨进模式也不转桨，只报状态 |
++| `FLIP_RC_CONFIRM` | 0 | — | 0 = 不需二次确认；1..6 = 还要对应 aux 通道在高位 |
++| `FLIP_EXIT_MODE` | 2 | — | 翻完切回的模式（0 Manual / 1 Alt / 2 Position / 3 Mission / 4 Hold / 5 Return / 6 Acro / 7 Offboard / 8 Stabilized） |
++| `FLIP_MODE` | 0 | — | 0 = 翻过去（60–90 压高位回正，90–180 抬高位翻过 180°，两组转向固定）；1 = 压回去（全程压高位，路径最短但 90° 要换向） |
++| `FLIP_ENTRY_ANG` | 75 | deg | 超过这个倾角才开始出力 |
++| `FLIP_STOP_ANG` | 60 | deg | 低于这个倾角收油，交给重力 |
++| `FLIP_THR_HIGH` | 0.20 | — | **高位组油门**（离地较高那两路）。产生翻正力矩的主攻组，全额 |
++| `FLIP_THR_LOW` | 0.10 | — | **低位组油门**（贴地那两路）。卸压/减摩擦的辅助组，可独立调，甚至设得比高位大 |
++| `FLIP_LOW_MODE` | 0 | — | 低位转向：0=Auto（永远抬，60–90 正转 / 90–180 反转）、1=强制正转、2=强制反转、3=关闭 |
++
++> **调参建议**：`FLIP_THR_HIGH` 是唯一真正决定翻正快慢的参数，先从 0.15 起步；
++> `FLIP_THR_LOW` 用来治"低位贴地磨得厉害/翻不动"，调大到 0.15~0.20 试试；
++> 若怀疑低位在帮倒忙，直接 `FLIP_LOW_MODE=3` 关掉做对照。
++| `FLIP_SLEW` | 0.50 | 1/s | 油门上升率 |
++| `FLIP_TIME` | 3.0 | s | 总出力上限 |
++| `FLIP_MIN_PROG` | 3.0 | deg | 进度检查阈值 |
++| `FLIP_PROG_T` | 0.8 | s | 多久后开始查进度 |
++| `FLIP_OUT_DIRECT` | 0 | — | 1 = 台架直发 `actuator_motors`（只驱动正转组） |
++
++---
++
++## 5. 调试顺序（拆桨！）
++
++1. **只观测不出力**：`FLIP_EN=0`，`commander mode flip`，用
++   `listener flip_recovery_control` 看 `tilt_deg / zone / fwd_mask / rev_mask`。
++   把机身摆到 80°、120°、180°，确认低位掩码选对了。
++2. **验证模式链路**：拨杆切进切出，`listener vehicle_status` 看
++   `nav_state` 是否变成 16、拨出是否变回。同时试
++   `commander mode flip` 和上位机 `SET_MODE`，确认三条路径都通。
++3. **验证禁止解锁**：停留在翻正模式，试 `commander arm`，应当被拒绝并提示
++   "mode not suitable for arming"。
++4. **验证让位**：`listener actuator_motors`，在翻正模式下应该**没有**新数据
++   （control_allocator 已闭嘴）；切回 Position 后恢复。
++5. **台架转桨**：`FLIP_EN=1`、`FLIP_OUT_DIRECT=1`、`FLIP_THR_HIGH=0.1`、`FLIP_LOW_MODE=3`（先只让高位转），
++   垫软物摆 80°，确认最低两路转、方向朝上。
++6. **带桨低推力**：`FLIP_THR_HIGH=0.15`、`FLIP_THR_LOW=0.08`，连续 10 次，检查电机温度、
++   每次结束是否归零。
++
++---
++
++## 6. 还没做完的一步（必须说清楚）
++
++**反转的物理执行仍然缺驱动层。**
++
++现在的链路是：
++
++```
++flip_recovery → flip_recovery_control.rev_mask / thr_rev
++                        │
++                        └─✗ 没有消费方
++```
++
++两个原因叠加：
++
++1. **未解锁不输出**：`MixingOutput::output_limit_calc(armed=false, ...)` 会走
++   `OutputLimitState::OFF`，把所有通道强制写成 `_disarmed_value`（DShot 是 0）。
++   `FLIP_OUT_DIRECT` 直发 `actuator_motors` 也绕不过这一层。
++2. **没有反向油门/方向命令**：DShot 常规模式只有 0..2047 单向油门，
++   要让电机反着转，只有两条路：
++   - **3D 油门**（`DSHOT_3D_ENABLE=1`，48..1047 反转 / 1047 停 / 1047..2047 正转）
++     —— 需要电调固件支持 3D。**Bluejay 不支持 3D 模式**，BLHeli_S 支持。
++   - **DShot 方向命令 20/21**（`spin_direction_normal` / `reversed`）
++     —— Bluejay 0.19 支持，但需要给 `src/drivers/dshot/DShot.cpp` 加一个
++     从 `flip_recovery_control` 到 `up_dshot_motor_command()` 的通道，
++     并在 `MixingOutput` 里开一个「未解锁允许出力」的 override。
++
++建议的下一步（照 LLJ5 的做法）：
++
++| 文件 | 要加的东西 |
++|---|---|
++| `src/drivers/dshot/DShot.{h,cpp}` | 订阅 `flip_recovery_control`，`ACTION_DRIVE` 时调 `up_dshot_motor_command(i, DShot_cmd_spin_direction_reversed/normal)` |
++| `src/lib/mixer_module/mixer_module.{hpp,cpp}` | `setFlipRecoveryOverride(bool, const float[])`：`_armed.armed==false` 时也走 `OutputLimitState::ON` |
++| `src/modules/flip_recovery/FlipRecovery.cpp` | `Done/Failed/退出模式` 时发 `ACTION_STOP`，驱动侧把方向复位成 normal |
++
++**这一步没有做，是因为它必须上真机验证**（不同 Bluejay 版本、不同电调对命令 20/21
++的响应不一样，写错了会让电机一直反着转）。代码可以先写，但没有实测的驱动层改动
++我不建议直接进固件。
++
++---
++
++## 7. Flash 占用
++
++v1.17.0 基线在 `micoair_h743-v2` 上剩余约 **61 KB**。
++本次模式化改动估计增加 **1.5–2.5 KB**（commander 分支 + 模块重写 + 新消息）：
++
++| 项 | 估算 |
++|---|---|
++| `FlipRecovery.cpp` 重写 + `requestExitMode` | +0.6 KB |
++| `FlipPlanner.hpp`（模板/内联，变化不大） | ±0 |
++| 新消息字段（`state` + `tilt_deg`） | +0.1 KB |
++| Commander / ui.hpp / mode_requirements 分支 | +0.5 KB |
++| 参数（新增 2 个，删除 1 个） | +0.3 KB |
++
++编译后请用 `arm-none-eabi-size` 确认，如果超了优先砍 `print_usage` 的长文本。
+diff --git a/docs/flip-recovery/README.md b/docs/flip-recovery/README.md
+new file mode 100644
+index 0000000000..b8c060068a
+--- /dev/null
++++ b/docs/flip-recovery/README.md
+@@ -0,0 +1,714 @@
++# 侧翻自动纠正 flip_recovery
++
++> PX4 v1.17.0 · MicoAir743v2-AIO-35A
++> 一个原生飞行模式：落地侧翻或倒扣后，按当前姿态自动选出高位/低位电机，把机身翻回正立。
++
++**当前状态**：模式接入、姿态算法、参数体系、状态观测全部完成，可直接编译刷写并验证；
++**DShot 出力层尚未实现**（见文末第 8 节），所以现在刷进去只能观测，桨不会转。
++
++---
++
++# 使用说明（必读）
++
++## 1. 先满足前置条件
++
++| 条件 | 要求 |
++|---|---|
++| 机架 | Quad-X（4 电机），`CA_ROTOR_COUNT = 4` |
++| 电调 | 支持 DShot，且能执行**方向命令 20/21**。本板 v2-AIO-35A 是 Bluejay 0.19.2，官方把命令 21 归为 turtle mode 功能，支持；45A 版是 AM32，另外还支持 3D 油门 |
++| 姿态估计 | EKF2 正常输出 `vehicle_attitude`（静止时即可，不需要 GPS） |
++| 遥控 | 可选。纯上位机触发时可以不接 |
++| 机身状态 | **未解锁**、**已落地**、油门摇杆最低 |
++
++## 2. 编译与刷写
++
++```bash
++make micoair_h743-v2_default
++```
++
++刷写时只刷 app，**不要动 bootloader**：
++
++```
++QGC → 固件设置 → 选择 .px4 文件 → 勾选 "仅刷写飞控固件"
++或
++px4 upload --port /dev/ttyACM0 build/micoair_h743-v2_default/micoair_h743-v2_default.px4
++```
++
++## 3. 参数配置
++
++### 必须先设的两项
++
++```
++param set FLIP_EN 1            # 总开关，0 = 拨进模式也不转桨
++param set COM_FLTMODE5 17      # 把第 5 档模式开关映射成 Flip Recovery
++param save
++```
++
++> `COM_FLTMODE1..6` 是模式槽位，改成 17 的那一档就变成"翻正模式"。
++> 不用拨杆的话这一项可以跳过，直接发指令。
++
++### 常用可调参数
++
++| 参数 | 默认 | 范围 | 作用 |
++|---|---|---|---|
++| **`FLIP_EN`** | 0 | bool | **总开关**。0 时模式可进、状态可见，但不转桨 |
++| **`FLIP_THR_HIGH`** | 0.20 | 0.02–0.6 | **高位组油门**。唯一真正决定翻正快慢的参数，从 0.15 起步 |
++| **`FLIP_THR_LOW`** | 0.10 | 0–0.6 | **低位组油门**。只负责卸压/减摩擦，正常应明显低于高位 |
++| **`FLIP_LOW_MODE`** | 0 | 0–3 | 低位转向调试：`0`=Auto（永远抬）、`1`=强制正转、`2`=强制反转、`3`=关闭 |
++| **`FLIP_MODE`** | 0 | 0–1 | 翻正策略：`0`=翻过去（90–180° 抬高位翻过 180°）、`1`=压回去（全程压高位，路径最短） |
++| `FLIP_ENTRY_ANG` | 75 | 60–180 | 超过这个倾角才出力 |
++| `FLIP_STOP_ANG` | 60 | 0–120 | 低于这个倾角收油，交给重力 |
++| `FLIP_EXIT_MODE` | 2 | 0–8 | 翻完自动切回的模式（2 = Position） |
++| `FLIP_RC_CONFIRM` | 0 | 0–6 | 0 = 免二次确认；1–6 = 还要对应 aux 通道在高位 |
++| `FLIP_SLEW` | 0.50 | 0.05–2.0 | 油门上升率（1/s），越小越温和 |
++| `FLIP_TIME` | 3.0 | 0.2–5.0 | 总出力时长上限（s） |
++| `FLIP_MIN_PROG` | 3.0 | 0–30 | 进度检查阈值（度） |
++| `FLIP_PROG_T` | 0.80 | 0.2–2.0 | 多久后开始查进度（s） |
++| `FLIP_OUT_DIRECT` | 0 | bool | 1 = 台架直发 `actuator_motors` |
++
++### 典型配置组合
++
++```
++# 保守起步（推荐第一次）
++param set FLIP_THR_HIGH 0.15
++param set FLIP_THR_LOW  0.08
++param set FLIP_LOW_MODE 0
++param set FLIP_MODE     0
++
++# 只让高位转，验证选边
++param set FLIP_LOW_MODE 3
++
++# 怀疑低位在拖后腿
++param set FLIP_LOW_MODE 1     # 强制正转，看是不是翻不动
++param set FLIP_LOW_MODE 2     # 强制反转
++```
++
++## 4. 触发方式
++
++四种方式最终都落到 `vehicle_status.nav_state = 16 (NAVIGATION_STATE_FLIP_RECOVERY)`。
++按场景选一种即可，不需要全配。
++
++### 方式 A：QGC 参数页（不用写代码）
++
++**第一步：把某个模式槽位指给翻正**
++
++1. QGC 连接飞控
++2. 左侧 **齿轮图标 → Parameters**
++3. 搜索框输入 `COM_FLTMODE`
++4. 找到 `COM_FLTMODE5`（或任意未使用的槽位），点右侧下拉框
++5. 选 **Flip Recovery**
++6. 点右上角 **Save**
++
++> 下拉里能出现 "Flip Recovery"，是因为固件在 `commander/module.yaml` 里把这个枚举描述成
++> `17: Flip Recovery`，QGC 读参数元数据时会显示出来。
++>
++> **注意：QGC 的 "Flight Modes" 页面里没有这个模式** —— 那个页面的模式列表是 QGC 硬编码的，
++> 只包含 PX4 标准模式。必须走 **Parameters** 页面。
++
++**第二步：触发**
++
++| 场景 | 操作 |
++|---|---|
++| 有遥控 | 见方式 B，拨杆切 |
++| 没遥控 / 台架 | QGC → **MAVLink Console** → 输入 `commander mode flip` |
++
++MAVLink Console 位置：QGC 左侧 **齿轮 → MAVLink Console**（部分版本在 "Analyze Tools" 下）。
++
++### 方式 B：遥控器拨杆（日常使用推荐）
++
++**前提：遥控器和开关已校准**
++
++1. QGC → **Vehicle Setup → Radio**
++2. 按提示把摇杆和所有开关拨到两端完成校准
++3. 校准完成后 QGC 会显示每个通道的映射条
++
++**模式槽位与开关档位的对应关系**
++
++| 开关位置 | 对应参数 |
++|---|---|
++| 第 1 档 | `COM_FLTMODE1` |
++| 第 2 档 | `COM_FLTMODE2` |
++| … | … |
++| 第 6 档 | `COM_FLTMODE6` |
++
++按方式 A 的步骤，把想用的那一档设成 **Flip Recovery**。例如：
++
++```
++COM_FLTMODE1 = Position         # 第 1 档：定点
++COM_FLTMODE2 = Altitude         # 第 2 档：定高
++COM_FLTMODE3 = Flip Recovery    # 第 3 档：翻正
++```
++
++**使用**
++
++拨到第 3 档 → 进入翻正模式；拨回任意其它档 → 立即收油退出。
++
++翻正模式禁止解锁（`mode_req_prevent_arming`），所以误拨之后也不会意外起飞。
++
++**可选：加一路二次确认**
++
++拨杆容易误碰，可以再要求一路开关同时在高位才出力：
++
++```
++param set FLIP_RC_CONFIRM 6    # 要求 aux6 通道在高位
++```
++
++### 方式 C：ROS2 话题（上位机自动流程）
++
++和发"降落"完全同一个套路 —— 都往 `VehicleCommand` 里填 `command`，本功能只多一个 `param1`：
++
++```python
++from px4_msgs.msg import VehicleCommand
++
++# 对照：发降落
++cmd.command = VehicleCommand.VEHICLE_CMD_NAV_LAND
++
++# 本功能：发翻正
++cmd.command = 10071      # VEHICLE_CMD_SET_NAV_STATE
++cmd.param1  = 16.0       # NAVIGATION_STATE_FLIP_RECOVERY
++```
++
++完整一帧：
++
++```python
++cmd = VehicleCommand()
++cmd.timestamp        = int(self.get_clock().now().nanoseconds / 1000)
++cmd.command          = 10071
++cmd.param1           = 16.0
++cmd.target_system    = 1
++cmd.target_component = 1
++cmd.from_external    = True
++self.cmd_pub.publish(cmd)
++```
++
++> `10071` 是 PX4 内部的 `VEHICLE_CMD_SET_NAV_STATE`，直接给 `nav_state` 数值，
++> 不用换算 `custom_mode` 位域。
++> 想用标准写法也行：`command = 176`（DO_SET_MODE）+ `param1 = 1` + `param2 = 12`。
++
++### 方式 D：板载命令行
++
++```
++commander mode flip
++```
++
++只用于台架调试，或没接 QGC 时通过串口 / nsh 输入。
++
++## 5. 执行结果回传（给上位机）
++
++翻正结束后模块会持续发布 `flip_recovery_status`，上位机订阅它就知道"这一步做完了没有"，
++**不需要轮询 `nav_state`，也不用读日志**。
++
++```
++uint8 state        # IDLE / RAMP / HOLD / COAST / DONE / FAILED
++uint8 result       # NONE / SUCCESS / FAILED
++uint8 reason       # TIMEOUT / NO_PROGRESS / SAFETY_LOST / MODE_EXITED / ATTITUDE_RESET
++float32 tilt_deg   # 结束时的倾角
++float32 duration_s # 从开始出力到结束的时长
++bool mode_active   # 是否仍停留在翻正模式（判断有没有自动切回）
++```
++
++### 上位机用法
++
++```python
++from px4_msgs.msg import FlipRecoveryStatus
++
++def status_cb(self, msg):
++    if msg.result == FlipRecoveryStatus.RESULT_NONE:
++        return                                    # 还在跑，什么都不做
++
++    if msg.result == FlipRecoveryStatus.RESULT_SUCCESS:
++        self.get_logger().info(f"翻正完成，用时 {msg.duration_s:.2f}s，倾角 {msg.tilt_deg:.1f}")
++        # 下一步：解锁 / 起飞 / 切回 Position
++
++    elif msg.result == FlipRecoveryStatus.RESULT_FAILED:
++        self.get_logger().warn(f"翻正失败，原因码 {msg.reason}")
++        # 下一步：重试（需先切出模式再切回）/ 上报
++```
++
++**去重**：`result` 一旦变成 SUCCESS / FAILED 就会一直保持，直到下一次开始出力才回到 NONE。
++所以上位机要记住上一次的 `result`，只在**跳变**时动作：
++
++```python
++if msg.result != self.last_result and msg.result != FlipRecoveryStatus.RESULT_NONE:
++    self.on_flip_finished(msg)
++self.last_result = msg.result
++```
++
++或者用 `session_id` 区分不同的尝试。
++
++### 失败原因码
++
++| reason | 含义 | 常见处理 |
++|---|---|---|
++| `1 TIMEOUT` | 出力超过 `FLIP_TIME` | 调大 `FLIP_TIME` 或 `FLIP_THR_HIGH` |
++| `2 NO_PROGRESS` | 进度检查没通过（选错边 / 方向反 / 推力不足） | 检查 `FLIP_LOW_MODE`、加大 `FLIP_THR_HIGH` |
++| `3 SAFETY_LOST` | 解锁、离地、遥控丢失、`FLIP_EN=0` | 检查现场条件 |
++| `4 MODE_EXITED` | 中途被切出模式 | 正常现象，下次重新进 |
++| `5 ATTITUDE_RESET` | 姿态估计被重置 | 检查 EKF2 |
++
++## 6. 退出
++
++| 方式 | 结果 |
++|---|---|
++| 拨杆拨回 / 在 QGC 切到任意其它模式 | 下一周期立即收油 |
++| 翻正完成或失败 | 自动切回 `FLIP_EXIT_MODE`（默认 Position） |
++| `param set FLIP_EN 0` | 立即停 |
++
++## 7. 观测
++
++```
++listener flip_recovery_control      # 倾角、zone、掩码、逐路油门
++listener flip_recovery_status       # 执行结果、时长、失败原因
++flip_recovery status                # 一次打印全部内部状态
++```
++
++正常会看到：
++
++```
++flip state 1: ramping up (tilt 121.3)
++flip zone 2 (tilt 121): HIGH(m0c) reversed @ 0.20 [lifts] | LOW(m03) reversed @ 0.10
++flip state 3: tilt below stop angle, gravity takes over
++flip done, switching back to mode 2
++```
++
++## 8. 安全约束（已内置，不需要你配）
++
++| 约束 | 实现 |
++|---|---|
++| 该模式下**禁止解锁** | `mode_req_prevent_arming` |
++| 只在未解锁时出力 | `_safe` 里检查 `!armed` |
++| 必须已落地 | `vehicle_land_detected.landed` |
++| 有遥控时油门必须在最低位 | `manual_control_setpoint.throttle < -0.8` |
++| 出力超时保护 | `FLIP_TIME`，默认 3 s |
++| 方向配反自动停 | `FLIP_PROG_T` 内倾角没减小就 `Failed` |
++| 本次失败后必须退出模式才能重试 | `_rearm_needed` |
++| 姿态被重置（切换估计器）立即放弃 | `quat_reset_counter` 变化检测 |
++
++# 实现原理
++
++## 1. 它是什么
++
++| 是 | 不是 |
++|---|---|
++| 一个正式的 `nav_state`，和 Position/Acro 平级 | 一个独立后台进程（没有模式时不参与控制） |
++| 只在未解锁 + 已落地时出力 | 飞行中的姿态保护 |
++| 靠两路电机推力差的**力矩**翻正 | 靠反扭矩（yaw）翻正 |
++| 翻完自动切回常规模式 | 翻完留在原地等指令 |
++
++进入该模式后，`vehicle_control_mode` 里所有 `flag_control_*` 都是 `false`，
++`flight_mode_manager`、`mc_att_control`、`mc_pos_control` 全部不启动，
++`control_allocator` 也不再发布 `actuator_motors`——执行器写入权完整地让给了本模块。
++
++## 2. 架构
++
++```
++src/modules/flip_recovery/              ← 模块外壳：uORB 订阅/发布、安全判定、参数
++        │
++        ▼
++src/lib/flip_recovery/FlipPlanner.hpp   ← 纯逻辑：姿态数学、选边、方向映射、状态机
++```
++
++拆成两层的理由：算法不依赖 uORB，可以脱离飞控跑数值验证。
++调度用 `ScheduledWorkItem` 挂在 `lp_default` 工作队列，20 ms 周期，不占独立线程。
++
++## 3. 数据流
++
++```
++BMI088 / BMI270（SPI, 1 kHz）
++   │
++   ▼
++sensors ── 校准、温补、低通
++   │
++   ▼
++vehicle_imu ── 多 IMU 聚合、时间对齐
++   │
++   ├─► EKF2 ── 陀螺积分预测 + 加速度计重力观测 + 磁力计航向
++   │      └─► vehicle_attitude.q（四元数，机体系 → NED）
++   │
++   └─► vehicle_angular_velocity
++   │
++   ▼
++flip_recovery（20 ms）
++   │
++   ▼
++flip_recovery_control（逐路带符号油门）
++   │
++   ▼
++DShot 驱动（待实现）→ 电调 → 电机
++```
++
++**为什么不用原始加速度计直接算倾角**：翻正时机身在转、有振动，`atan2` 出来会抖十几度。
++EKF2 已融合陀螺和加速度，输出平滑且延迟只有 5~10 ms。
++
++## 4. 算法
++
++### 4.1 倾角：为什么用 `R(2,2)`
++
++```cpp
++alignment = Dcmf(q)(2, 2);          // 机体 +Z 在世界天向上的投影
++tilt      = acos(constrain(alignment, -1, 1));
++```
++
++| 姿态 | `R(2,2)` | `tilt` |
++|---|---|---|
++| 正立 | `+1` | 0° |
++| 侧躺 | `0` | 90° |
++| 完全倒扣 | `−1` | 180° |
++
++不用欧拉角的三个理由：
++
++1. **无万向锁** —— pitch = ±90° 时 roll 无定义，而 90° 恰好是分界点
++2. **无组合歧义** —— `pitch=90° + roll=90°` 的总倾角不是 127°
++3. **一次三角运算**，对 0°/180° 数值稳定
++
++### 4.2 选边：高位与低位
++
++```cpp
++h[i] = R(2,0) * px[i] + R(2,1) * py[i];    // 电机相对重心的世界竖直高度
++```
++
++`px/py` 来自 PX4 自己的 `CA_ROTORn_PX/PY`，所以**电机号天然与 PX4 一致**，不需要另建映射表。
++
++按 `h` 排序，最小的两路 = **低位组**，剩下 = **高位组**。
++
++**低位组的连线就是翻正转轴**（机身倾斜时贴地的那条棱）：
++
++```
++        高位组（离转轴最远，力臂最大）
++       ●───────────●
++       │           │
++       │     CG    │
++       ●───────────●
++     ═════════════════════   ← 地面
++        低位组（就在转轴上，力臂 ≈ 0）
++```
++
++| 组 | 力臂 | 职责 |
++|---|---|---|
++| **高位** | 最大 | 唯一产生翻正力矩，全额油门 |
++| **低位** | ≈ 0 | 只负责"抬一点"，卸掉地面正压力、减小绕轴摩擦 |
++
++**低位为什么不能压**：压下去 → 正压力增大 → 摩擦锁住转轴 → 高位转不动。
++
++### 4.3 方向映射：三个概念必须分清
++
++| 概念 | 含义 | 参照系 |
++|---|---|---|
++| **桨对空气** | 螺旋桨把空气往哪甩 | 机体 ±Z |
++| **机身受力 `Push`** | 空气对机身的反作用力，永远与"桨对空气"相反 | 世界系 |
++| **电机转向** | `Normal` 出厂 / `Reversed` 反着转 | 机体系 |
++
++`Normal` 的定义基准：正常飞行（tilt=0）时桨朝下甩空气 → 机身获得向上的升力。
++
++| 倾角 | `R(2,2)` | 机体 −Z 指向 | `Normal` 桨对空气 | `Normal` 机身受力 |
++|---|---|---|---|---|
++| 60–90° | `> 0` | 朝下偏侧 | 朝下 | **朝上** |
++| 90–180° | `< 0` | 朝上偏侧 | **朝上** | **朝下** |
++
++代码里只用一行统一换算，绝不手写区间 `if/else`：
++
++```cpp
++const bool normal_is_up = (R(2, 2) > 0.f);
++const bool high_normal  = ((high_push == Push::Up) == normal_is_up);
++```
++
++### 4.4 两种策略
++
++**策略 A「翻过去」`FLIP_MODE=0`（默认）**
++
++| 倾角 | 高位目标 | 高位电机 | 低位目标 | 低位电机 | 效果 |
++|---|---|---|---|---|---|
++| 60–90° | `Push::Down`（压） | Reversed | `Push::Up`（抬） | Normal | tilt 减小，回正 |
++| 90–180° | `Push::Up`（抬） | Reversed | `Push::Up`（抬） | Reversed | tilt 增大，翻过 180° |
++
++高位全程 Reversed，只有低位在 90° 换向。
++
++**策略 B「压回去」`FLIP_MODE=1`**
++
++| 倾角 | 高位 | 低位 | 效果 |
++|---|---|---|---|
++| 60–180° | `Push::Down` | `Push::Up` | 始终朝 0° 拉 |
++
++代价：90–120° 段策略 A 要转 240–270°，策略 B 只要 90–120°；但策略 B 高位要在 90° 换向。
++
++### 4.5 状态机
++
++```
++        ┌───────────────────────────────────────────────┐
++   Idle ─┤ mode_active && safe && enabled && tilt≥entry  │
++        ▼                                               │
++      Ramp ──(油门到目标)──► Hold ──(tilt≤stop)──► Coast ──(稳定/1.5s)──► Done
++        │                     │                                          │
++        │                     └─(超时 / 无进度)──► Failed                │
++        └─(安全丢失 / 模式退出)──────────────────► Failed                 │
++                                                                         │
++   Done / Failed 置 _rearm_needed，必须退出模式再进才能重试 ◄──────────────┘
++```
++
++三个退出条件：
++
++| 条件 | 判据 | 作用 |
++|---|---|---|
++| 成功收油 | `tilt ≤ FLIP_STOP_ANG` | 已经足够正，交给重力 |
++| 超时 | 出力 > `FLIP_TIME` | 电机/电调过热保护 |
++| 无进度 | `FLIP_PROG_T` 内倾角减少 < `FLIP_MIN_PROG` | 抓"选错边/方向配反/推力不够" |
++
++第三条最关键：如果电机方向配反，倾角会**变大**，0.8 s 内就能发现并停机。
++
++### 4.6 油门
++
++```cpp
++thr_high = min(FLIP_THR_HIGH, 0.60);
++thr_low  = low_enabled ? min(FLIP_THR_LOW, 0.60) : 0;
++_thr     = min(max(thr_high, thr_low), _thr + FLIP_SLEW * dt);   // 斜坡
++control[i] = ±min(_thr, 该组目标油门);
++```
++
++- **斜坡**默认 0.5/s，0.4 s 到顶，避免电流尖峰
++- **硬上限 0.60** 写死在 `HARD_MAX_THROTTLE`，参数填再大也超不过
++- `_thr` 是全局进度，每组取 `min(_thr, 自己的目标)`
++
++**为什么必须逐路输出**：90–180° 段高位和低位同为 Reversed，但油门不同（0.20 vs 0.10），
++两个标量（"正转组油门/反转组油门"）表达不了，所以消息里是 `float32[4] control`。
++
++---
++
++# 代码改动清单
++
++## 新增
++
++| 文件 | 内容 |
++|---|---|
++| `msg/FlipRecoveryControl.msg` | 控制请求：`state` / `action` / `zone` / `fwd_mask` / `rev_mask` / `float32[4] control` / `tilt_deg` |
++| `msg/FlipRecoveryStatus.msg` | 执行结果回传：`result`（SUCCESS/FAILED）/ `reason`（5 种失败原因）/ `duration_s` / `mode_active` |
++| `src/lib/flip_recovery/FlipPlanner.hpp` | 纯逻辑：倾角、选边、方向映射、状态机、逐路油门 |
++| `src/modules/flip_recovery/FlipRecovery.hpp` | 模块类：订阅/发布、参数声明 |
++| `src/modules/flip_recovery/FlipRecovery.cpp` | 主循环：取数 → 安全判定 → 调规划器 → 发布 → 收尾切模式 |
++| `src/modules/flip_recovery/flip_recovery_params.c` | 14 个 `FLIP_*` 参数 |
++| `src/modules/flip_recovery/CMakeLists.txt` / `Kconfig` | 构建与 `MODULES_FLIP_RECOVERY` 开关 |
++
++## 修改
++
++| 文件 | 改了什么 | 为什么 |
++|---|---|---|
++| `msg/versioned/VehicleStatus.msg` | `NAVIGATION_STATE_FREE1=16` → `NAVIGATION_STATE_FLIP_RECOVERY=16` | 复用空闲槽位，`MAX` 保持 31，位掩码/ROS2 消息/外部工具零影响 |
++| `msg/CMakeLists.txt` | 注册 `FlipRecoveryControl.msg` 和 `FlipRecoveryStatus.msg` | 不注册就不生成头文件 |
++| `src/modules/commander/px4_custom_mode.h` | 加 `PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY`（=12）；`get_px4_custom_mode()` 加反查 | MAVLink 的 `custom_mode` 字节需要它；反查用于心跳上报 |
++| `src/lib/modes/ui.hpp` | `getValidNavStates()` 加位；`nav_state_names[16]` = "Flip Recovery" | 不加位 → 拨杆切换被判非法；不改名 → OSD 显示 `16: UNUSED2` |
++| `ModeUtil/control_mode.cpp` | 该模式 case 内**所有 flag 保持 false** | `ControlAllocator` 用 `flag_control_allocation_enabled` 决定是否发布 `actuator_motors`，留 false 就等于让位 |
++| `ModeUtil/mode_requirements.cpp` | attitude + angular_velocity + manual_control + **prevent_arming** | 前三条保证算法有输入；最后一条保证不能带着翻正模式解锁 |
++| `Commander.cpp` | `DO_SET_MODE` 解析分支；CLI `commander mode flip`；usage 文本 | 所有上位机路径和自动切回都汇到这个 switch |
++| `commander/module.yaml` | `COM_FLTMODE` 枚举加 `17: Flip Recovery` | QGC 参数页下拉选项 |
++| `manual_control/ManualControl.cpp` | `navStateFromParam` 加 `case 17` | PX4 1.16 起拨杆逻辑搬到 manual_control，漏这里拨杆失效 |
++| `boards/.../default.px4board` | `CONFIG_MODULES_FLIP_RECOVERY=y` | 编译进固件 |
++| `boards/.../init/rc.board_extras` | 改为无条件 `flip_recovery start` | 模式化后必须常驻，否则改参数要重启飞控才能用 |
++
++### 让它"让位"的关键链路
++
++```
++Commander::updateControlMode() 先 _vehicle_control_mode = {}
++  → control_mode.cpp 的 FLIP_RECOVERY case 不设任何 flag
++  → ControlAllocator.cpp:372  _publish_controls = flag_control_allocation_enabled → false
++  → ControlAllocator::publish_actuator_controls() 开头 if (!_publish_controls) return;
++  → 分配器停止发布 actuator_motors，写入权归 flip_recovery
++```
++
++---
++
++# 调试流程（拆桨）
++
++1. **只观测**：`FLIP_EN=0`，`commander mode flip`，`listener flip_recovery_control` 看 `tilt_deg / zone / masks`。
++   摆 80°、120°、180°，确认低位掩码选对。
++2. **验模式链路**：拨杆切进切出，`listener vehicle_status` 看 `nav_state` 是否变 16。再试 CLI 和 MAVLink。
++3. **验禁止解锁**：停在翻正模式，`commander arm` 应被拒，提示 "mode not suitable for arming"。
++4. **验让位**：`listener actuator_motors`，翻正模式下应无新数据；切回 Position 恢复。
++5. **单组转桨**：`FLIP_EN=1`、`FLIP_LOW_MODE=3`（只高位）、`FLIP_THR_HIGH=0.10`，垫软物摆 80°。
++6. **加低位**：`FLIP_LOW_MODE=0`、`FLIP_THR_LOW=0.05`。
++7. **对照**：`FLIP_LOW_MODE=1/2` 看低位正转/反转哪个更顺。
++8. **带桨低推力**：`FLIP_THR_HIGH=0.15`、`FLIP_THR_LOW=0.08`，连续 10 次查温度。
++
++---
++
++# 8. DShot 出力层（进行中）
++
++拆成两层：**能不能输出**（软件门控）和**输出什么方向**（电调能力）。
++
++## 8.1 已完成：未解锁也允许出力
++
++PX4 原本在 `MixingOutput` 里有三道门把未解锁时的输出全部抹成 0：
++
++```cpp
++// 1. 值被抹成 NaN
++if (_armed.armed || (_armed.prearmed && _functions[i]->allowPrearmControl())) {
++    outputs[i] = _functions[i]->value(...);
++} else {
++    outputs[i] = NAN;
++}
++
++// 2. 油门标志只有两种情况下为 true
++_throttle_armed = (_armed.armed && !_armed.lockdown) || _armed.in_esc_calibration_mode;
++
++// 3. 状态机强制归零
++case OutputLimitState::OFF:
++    for (int i = 0; i < num_channels; i++) {
++        _current_output_value[i] = _disarmed_value[i];
++    }
++```
++
++现在加了一条与 `actuator_test` **平行**的通路，完全绕开 `_functions[]`：
++
++```cpp
++void MixingOutput::setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS]);
++
++// update() 里，_actuator_test.update() 之后
++if (_recovery_active && !_armed.armed && !_armed.kill
++    && !_armed.lockdown && !_armed.termination) {
++    _reversible_mask = 0;      // 不走 3D 编码
++
++    for (int i = 0; i < _max_num_outputs; ++i) {
++        const float value = _recovery_outputs[i];
++        _current_output_value[i] = (PX4_ISFINITE(value) && value > 0.f)
++                                   ? output_limit_calc_single(i, value)
++                                   : _disarmed_value[i];
++    }
++
++    if (_interface.updateOutputs(_current_output_value, _max_num_outputs, has_updates)) {
++        ... 发布 actuator_outputs ...
++    }
++
++    return true;
++}
++```
++
++三个安全条件缺一不可：**调用方要求接管** + **确实未解锁** + **没有 kill/lockdown/termination**。
++默认 `_recovery_active = false`，对其它机型、其它模式零影响。
++
++调用方是 `DShot::handle_flip_recovery()`：
++
++```cpp
++void DShot::handle_flip_recovery()
++{
++    flip_recovery_control_s msg;
++    const bool updated = _flip_recovery_sub.update(&msg);
++
++    // 话题超时（模块退出/重启）-> 立即放手
++    if (!updated) {
++        if (_mixing_output.recoveryActive() && hrt_elapsed_time(&_last_flip_recovery) > 200_ms) {
++            _mixing_output.setRecoveryOutputs(false, nullptr);
++        }
++        return;
++    }
++
++    _last_flip_recovery = msg.timestamp;
++
++    const bool drive = (msg.action == flip_recovery_control_s::ACTION_DRIVE);
++
++    float outputs[MAX_ACTUATORS] {};
++    if (drive) {
++        for (unsigned i = 0; i < 4; ++i) {
++            const float control = msg.control[i];
++            outputs[i] = (control > 0.f) ? control : -control;   // 取绝对值
++        }
++    }
++
++    _mixing_output.setRecoveryOutputs(drive, outputs);
++}
++```
++
++`200 ms` 超时是兜底：万一 `flip_recovery` 崩了或被杀，电机不会一直转。
++
++## 8.2 未完成：反向
++
++现在 `control[i]` 的**符号被丢弃**了，所有电机都按出厂方向转。要走完整翻正还需要：
++
++1. **换向时机**：DShot 规范要求方向命令在电机**停转**时发送。
++   `DShot::updateOutputs()` 里只有 `output == DSHOT_DISARM_VALUE(0)` 才会发命令帧，
++   所以必须先停机、发命令、等电调处理、再给油门。
++   参考 LLJ5 的做法：停机 500 ms → 连发 10 帧 → 3 s 超时。
++2. **命令通道**：PX4 原生已有 `DShot_cmd_spin_direction_normal(20)` / `reversed(21)`，
++   `_current_command` 机制可直接复用，但一次只能发一个 motor_mask。
++
++建议的实现：
++
++```cpp
++// ACTION_DRIVE 的第一个阶段：油门保持 0，对 rev_mask 发一次 21，对 fwd_mask 发 20
++if (drive && phase == Direction && !_current_command.valid()) {
++    _current_command.command = msg.rev_mask ? DShot_cmd_spin_direction_reversed
++                                            : DShot_cmd_spin_direction_normal;
++    _current_command.motor_mask = msg.rev_mask;
++    _current_command.num_repetitions = 10;
++    phase = Throttle;
++}
++
++// 第二阶段才真正给油门
++if (drive && phase == Throttle) { ... }
++
++// 退出：对全部发一次 20，把方向复位
++if (!drive && _direction_dirty) { ... }
++```
++
++## 8.3 测试方法
++
++### 先测电调是否支持方向命令（不需要任何新代码）
++
++PX4 原生就有这个 CLI：
++
++```
++dshot reverse -m 1      # 对 Motor1 发命令 21（反转），重复 10 帧
++dshot normal  -m 1      # 发命令 20（恢复）
++```
++
++**拆桨**，执行后用手摸电机轴或听声音（`dshot beep1 -m 1` 也能辅助判断）。
++如果转向真的反了，说明电调支持，8.2 可以做；如果没反应，再检查是不是命令发在了非停转状态。
++
++**本板已知信息**（v2-AIO-35A = Bluejay 0.19.2）：Bluejay 的功能表把命令 21 明确列为
++"Turtle mode, supported"，所以预期是支持的，这一步主要是确认电调固件版本没被改过。
++
++### 35A 与 45A 的差别（影响实现路线）
++
++| | v2-AIO-35A | v2-AIO-45A |
++|---|---|---|
++| 电调 | 4×35A **Bluejay** | 4×45A **AM32** |
++| MCU | 8-bit SiLabs EFM8 | 32-bit AT32F421 |
++| 3D 油门（负油门反转） | **不支持** | **支持** |
++| 方向命令 20/21 | 支持 | 支持 |
++
++所以本板只能走方向命令，`MixingOutput` 里清 `_reversible_mask` 是必须的。
++注意别和老款 `MicoAir743-AIO-35A`（非 v2，AM32）搞混。
++
++### 再测未解锁出力
++
++```
++param set FLIP_EN 1
++commander mode flip
++```
++
++用 `listener flip_recovery_control` 确认模块在发 `ACTION_DRIVE`，
++然后看电机是否在**未解锁**状态下按 `control[]` 的绝对值转起来。
++
++**这一步只能验证"能不能转"，方向还不对**——因为符号被丢弃了。
++正确做法是先按 8.3 第一段确认电调能力，再补 8.2。
++
++# 9. Flash 占用
++
++v1.17.0 基线在 `micoair_h743-v2` 上剩余约 61 KB。
++
++| 项 | 估算 |
++|---|---|
++| `FlipRecovery.cpp` + 模块骨架 | +0.8 KB |
++| `FlipPlanner.hpp`（模板/内联） | +0.4 KB |
++| 新消息（含 `control[4]`） | +0.2 KB |
++| Commander / ui.hpp / mode_requirements 分支 | +0.5 KB |
++| 参数（14 个） | +0.6 KB |
++| **合计** | **约 +2.5 KB** |
++
++---
++
++# 参考
++
++| 项目 | 说明 |
++|---|---|
++| PX4 PR #29750 | 原生反乌龟方案（commander/allocator/dshot 全链路），手控触发 |
++| [LLJ5/PX4_Turtle_Mico](https://github.com/LLJ5/PX4_Turtle_Mico) | 自动右翻，基线同为 v1.17.0 |
++| [BENSHLOMO/px4-fpv-extensions](https://github.com/BENSHLOMO/px4-fpv-extensions) | 21 个 `TRTL_*` 参数，MicoAir H743 V2 验证过 |
++| ArduPilot `mode_turtle.cpp` | 原生 turtle 模式 |
+diff --git a/msg/CMakeLists.txt b/msg/CMakeLists.txt
+index 7eda1cc316..45045cfaa2 100644
+--- a/msg/CMakeLists.txt
++++ b/msg/CMakeLists.txt
+@@ -91,6 +91,8 @@ set(msg_files
+ 	FollowTarget.msg
+ 	FollowTargetEstimator.msg
+ 	FollowTargetStatus.msg
++	FlipRecoveryControl.msg
++	FlipRecoveryStatus.msg
+ 	FuelTankStatus.msg
+ 	FixedWingLateralGuidanceStatus.msg
+ 	FixedWingLateralStatus.msg
+diff --git a/msg/FlipRecoveryControl.msg b/msg/FlipRecoveryControl.msg
+new file mode 100644
+index 0000000000..fe5ff056e7
+--- /dev/null
++++ b/msg/FlipRecoveryControl.msg
+@@ -0,0 +1,38 @@
++# 翻正控制请求：由 flip_recovery 模块产生。
++# 两个消费方：
++#   1) 电机输出后端（DShot / PWM 驱动）—— 真正把桨转起来（当前版本尚未接线）
++#   2) 地面站 / 上位机 —— 用于观测状态机与实时倾角
++#
++# 该话题只在 NAVIGATION_STATE_FLIP_RECOVERY 模式下才有 DRIVE 动作。
++
++uint64 timestamp
++uint64 session_id              # 本次翻正会话的唯一标识（进入模式的时刻，us）
++
++uint8 ACTION_STOP = 0          # 停桨，后端应恢复电机默认转向
++uint8 ACTION_DRIVE = 1         # 按 control[] 出力
++
++uint8 ZONE_OFF = 0             # 倾角 < 停止角，不出力，靠重力
++uint8 ZONE_UPRIGHT = 1         # 60~90 度：cos(tilt)>0，电机 Normal 的机身受力朝上
++uint8 ZONE_INVERTED = 2        # 90~180 度：cos(tilt)<0，电机 Normal 的机身受力朝下
++
++uint8 STATE_IDLE = 0
++uint8 STATE_RAMP = 1           # 油门斜坡上升中
++uint8 STATE_HOLD = 2           # 达到目标油门，持续出力
++uint8 STATE_COAST = 3          # 已收油，等重力把机身放平
++uint8 STATE_DONE = 4
++uint8 STATE_FAILED = 5
++
++uint8 state                    # 状态机当前状态（STATE_*）
++uint8 action                   # ACTION_*
++uint8 zone                     # ZONE_*
++uint8 fwd_mask                 # control[i] > 0 的电机（Normal，bit0=Motor1）
++uint8 rev_mask                 # control[i] < 0 的电机（Reversed）
++
++# 逐路电机的带符号油门，与 CA_ROTORn 序号一致（bit/下标 0 = Motor1）：
++#   > 0 : 该路按 Normal 方向转，油门取绝对值
++#   < 0 : 该路按 Reversed 方向转（DShot 方向命令 20/21 或 3D 油门）
++#   = 0 : 该路停转
++# 必须逐路给：策略 A 的 90~180° 段高/低位同为 Reversed，但油门不同（高位全额、低位打折），
++# 用单一"反转组油门"无法表达。
++float32[4] control            # [@range -1, 1] 归一化 DShot 油门，不是推力百分比
++float32 tilt_deg               # 当前倾角：0 正立，90 侧躺，180 倒扣
+diff --git a/msg/FlipRecoveryStatus.msg b/msg/FlipRecoveryStatus.msg
+new file mode 100644
+index 0000000000..f04733784d
+--- /dev/null
++++ b/msg/FlipRecoveryStatus.msg
+@@ -0,0 +1,37 @@
++# 翻正状态回传：给上位机判断"这一步做完了没有"。
++#
++# 与控制请求 flip_recovery_control 的区别：
++#   flip_recovery_control 是模块 -> 电机后端的控制指令
++#   flip_recovery_status  是模块 -> 上位机的执行结果
++#
++# 上位机的典型用法：
++#   发完切模式命令后开始订阅本话题，等 result != RESULT_NONE 即可发下一步
++#   （解锁、起飞、切回其它模式…），不需要轮询 nav_state 或读日志。
++
++uint64 timestamp
++uint64 session_id              # 本次翻正会话标识，与 flip_recovery_control 一致
++
++uint8 STATE_IDLE = 0
++uint8 STATE_RAMP = 1
++uint8 STATE_HOLD = 2
++uint8 STATE_COAST = 3
++uint8 STATE_DONE = 4
++uint8 STATE_FAILED = 5
++
++uint8 RESULT_NONE = 0          # 还没结束（进行中或未开始）
++uint8 RESULT_SUCCESS = 1       # 倾角已降到停止角以下，翻正完成
++uint8 RESULT_FAILED = 2        # 失败，看 reason
++
++uint8 REASON_NONE = 0
++uint8 REASON_TIMEOUT = 1       # 出力超过 FLIP_TIME
++uint8 REASON_NO_PROGRESS = 2   # 进度检查未通过（选错边 / 方向反 / 推力不足）
++uint8 REASON_SAFETY_LOST = 3   # 安全条件丢失（解锁、离地、遥控丢失、FLIP_EN=0）
++uint8 REASON_MODE_EXITED = 4   # 翻正中途被切出模式
++uint8 REASON_ATTITUDE_RESET = 5 # 姿态估计被重置
++
++uint8 state                    # STATE_*
++uint8 result                   # RESULT_*
++uint8 reason                   # REASON_*，仅 result == RESULT_FAILED 时有意义
++float32 tilt_deg               # 结束时（或当前）倾角
++float32 duration_s             # 从开始出力到结束的时长
++bool mode_active               # 当前是否仍停留在翻正模式（用于判断是否已自动切回）
+diff --git a/msg/versioned/VehicleStatus.msg b/msg/versioned/VehicleStatus.msg
+index 0dffdc2c92..3a031c116e 100644
+--- a/msg/versioned/VehicleStatus.msg
++++ b/msg/versioned/VehicleStatus.msg
+@@ -49,7 +49,7 @@ uint8 NAVIGATION_STATE_DESCEND = 12             # Descend mode (no position cont
+ uint8 NAVIGATION_STATE_TERMINATION = 13         # Termination mode
+ uint8 NAVIGATION_STATE_OFFBOARD = 14
+ uint8 NAVIGATION_STATE_STAB = 15                # Stabilized mode
+-uint8 NAVIGATION_STATE_FREE1 = 16
++uint8 NAVIGATION_STATE_FLIP_RECOVERY = 16      # Tilt flip recovery (reuses the former FREE1 slot)
+ uint8 NAVIGATION_STATE_AUTO_TAKEOFF = 17        # Takeoff
+ uint8 NAVIGATION_STATE_AUTO_LAND = 18           # Land
+ uint8 NAVIGATION_STATE_AUTO_FOLLOW_TARGET = 19  # Auto Follow
+diff --git a/src/drivers/dshot/DShot.cpp b/src/drivers/dshot/DShot.cpp
+index 92fec8e76e..a3a164cb86 100644
+--- a/src/drivers/dshot/DShot.cpp
++++ b/src/drivers/dshot/DShot.cpp
+@@ -472,6 +472,8 @@ void DShot::Run()
+ 
+ 	perf_begin(_cycle_perf);
+ 
++	handle_flip_recovery();
++
+ 	_mixing_output.update();
+ 
+ 	// update output status if armed or if mixer is loaded
+@@ -539,6 +541,40 @@ void DShot::Run()
+ 	perf_end(_cycle_perf);
+ }
+ 
++void DShot::handle_flip_recovery()
++{
++	flip_recovery_control_s msg;
++	const bool updated = _flip_recovery_sub.update(&msg);
++
++	// 话题超时（模块退出、崩溃、或模式切走后不再刷新）-> 立即放手，避免电机一直转
++	if (!updated) {
++		if (_mixing_output.recoveryActive() && hrt_elapsed_time(&_last_flip_recovery) > 200_ms) {
++			_mixing_output.setRecoveryOutputs(false, nullptr);
++		}
++
++		return;
++	}
++
++	_last_flip_recovery = msg.timestamp;
++
++	// 只有模块明确要求 DRIVE 时才接管；STOP 一律交回正常路径
++	const bool drive = (msg.action == flip_recovery_control_s::ACTION_DRIVE);
++
++	float outputs[MAX_ACTUATORS] {};
++
++	if (drive) {
++		// 本层只负责油门大小，取绝对值。
++		// 方向（control[i] < 0 -> 电机反转）留给下一阶段：
++		// 需要在电机停转时先发 DShot 方向命令 20/21，再给油门。
++		for (unsigned i = 0; i < 4; ++i) {
++			const float control = msg.control[i];
++			outputs[i] = (control > 0.f) ? control : -control;
++		}
++	}
++
++	_mixing_output.setRecoveryOutputs(drive, outputs);
++}
++
+ void DShot::handle_vehicle_commands()
+ {
+ 	vehicle_command_s vehicle_command;
+diff --git a/src/drivers/dshot/DShot.h b/src/drivers/dshot/DShot.h
+index 8137e461e2..cd286e7a28 100644
+--- a/src/drivers/dshot/DShot.h
++++ b/src/drivers/dshot/DShot.h
+@@ -33,12 +33,14 @@
+ #pragma once
+ 
+ #include <drivers/drv_dshot.h>
++#include <drivers/drv_hrt.h>
+ #include <lib/mixer_module/mixer_module.hpp>
+ #include <px4_platform_common/getopt.h>
+ #include <px4_platform_common/module.h>
+ #include <uORB/topics/esc_status.h>
+ #include <uORB/topics/vehicle_command.h>
+ #include <uORB/topics/vehicle_command_ack.h>
++#include <uORB/topics/flip_recovery_control.h>
+ 
+ #include "DShotTelemetry.h"
+ 
+@@ -136,6 +138,7 @@ private:
+ 	void update_num_motors();
+ 
+ 	void handle_vehicle_commands();
++	void handle_flip_recovery();
+ 
+ 	uint16_t convert_output_to_3d_scaling(uint16_t output);
+ 
+@@ -170,6 +173,8 @@ private:
+ 
+ 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
+ 	uORB::Subscription _vehicle_command_sub{ORB_ID(vehicle_command)};
++	uORB::Subscription _flip_recovery_sub{ORB_ID(flip_recovery_control)};
++	hrt_abstime _last_flip_recovery{0};
+ 	uORB::Publication<vehicle_command_ack_s> _command_ack_pub{ORB_ID(vehicle_command_ack)};
+ 	uint16_t _esc_status_counter{0};
+ 
+diff --git a/src/lib/flip_recovery/FlipPlanner.hpp b/src/lib/flip_recovery/FlipPlanner.hpp
+new file mode 100644
+index 0000000000..3d5e21401a
+--- /dev/null
++++ b/src/lib/flip_recovery/FlipPlanner.hpp
+@@ -0,0 +1,479 @@
++/****************************************************************************
++ * 倾角翻正规划器（纯逻辑，无 uORB 依赖，方便单测）
++ *
++ * 输入：姿态四元数、电机几何、参数、安全条件、模式是否处于激活状态
++ * 输出：需要正转/反转的电机掩码 + 各自油门 + 当前工作区（zone）+ 状态机状态
++ *
++ * ============================ 术语约定（唯一权威） ============================
++ *
++ * 【桨对空气】螺旋桨把空气往哪甩。正常飞行（tilt=0）时朝下甩，所以机身获得升力。
++ *
++ * 【机身受力 Push】空气对机身的反作用力方向。永远与"桨对空气"相反。
++ *      Push::Up   = 空气把机身往天上推
++ *      Push::Down = 空气把机身往地面压
++ *   本文件全程只用它表达"想让机身怎么动"，因为真正让机身穿转起来的是这个力。
++ *
++ * 【电机转向】描述电机自己怎么转：
++ *      Normal   = 出厂方向 -> 桨对空气沿机体 -Z
++ *      Reversed = 反着转   -> 桨对空气沿机体 +Z
++ *
++ *   换算（全部歧义都在这里）：
++ *      R(2,2) = cos(tilt) > 0（tilt < 90°，机体 -Z 朝下）：
++ *          Normal -> 桨对空气朝下 -> Push::Up
++ *      R(2,2) < 0（tilt > 90°，机体 -Z 朝上）：
++ *          Normal -> 桨对空气朝上 -> Push::Down
++ *
++ *   代码里统一用 normal_is_up = (R(2,2) > 0) 做一次换算，绝不手写区间 if/else。
++ *
++ * ================================ 物理约定 ================================
++ *
++ *   R = Dcmf(q) 机体->世界，alignment = R(2,2) = cos(倾角)
++ *   tilt = acos(alignment)：0° 正立，90° 侧躺，180° 完全倒扣
++ *   电机高度 h_i = R(2,0)*PX_i + R(2,1)*PY_i，越小越贴地
++ *
++ * ================================ 力臂与策略 ================================
++ *
++ *   翻正的瞬时转轴 = 两个低位电机的连线（贴地那条棱）。
++ *
++ *   高位组：离转轴最远，力臂最大 -> 唯一产生翻正力矩的组，永远全额油门。
++ *   低位组：就在转轴上，力臂≈0    -> 力矩贡献可忽略，唯一作用是
++ *           「把机身往上抬一点，减轻地面正压力、减小绕轴摩擦」。
++ *           若反过来往下压，支点会被压死、摩擦锁住转轴，反而拖累高位。
++ *           所以低位**永远 Push::Up（抬）**，只是 90° 前后"抬"对应的电机转向不同。
++ *
++ *   两种策略（60~90° 完全一致，只在 90~180° 分道扬镳）：
++ *     FlipOver（默认）: 高位全程 Reversed
++ *        60~90  : 高位 Push::Down（压回正） + 低位 Push::Up（抬）
++ *        90~180 : 高位 Push::Up  （抬，翻过去）+ 低位 Push::Up（抬）
++ *        低位在 90° 处 Normal -> Reversed，高位不换向
++ *     PressBack: 高位全程 Push::Down（压回去）
++ *        60~180 : 高位 Push::Down + 低位 Push::Up
++ *        路径最短，但高位在 90° 处要换向
++ *
++ * ================================ 触发模型 ================================
++ *
++ *   不再用 AUX 开关电平触发，而是由飞行模式驱动。
++ *   上层把 nav_state == FLIP_RECOVERY 传成 in.mode_active，
++ *   本文件只负责"模式激活期间"的状态机；模式的进出由 Commander 管。
++ ****************************************************************************/
++#pragma once
++
++#include <cmath>
++#include <cstdint>
++#include <mathlib/mathlib.h>
++#include <matrix/matrix/math.hpp>
++
++namespace flip_recovery
++{
++// 油门硬上限：DShot 归一化值，不是推力/功率百分比
++static constexpr float HARD_MAX_THROTTLE = 0.60f;
++
++// 机身受力方向（= 空气对飞机的反作用力方向）。
++// 注意：螺旋桨"对空气"的推力方向永远与它相反 —— 本文件统一只描述机身受力，
++// 因为真正让机身转起来的是这个力。
++enum class Push : uint8_t {
++	Up = 0,    // 把机身往天上推（对应桨把空气朝下甩）
++	Down = 1,  // 把机身往地面压（对应桨把空气朝上甩）
++};
++
++// 翻正策略。两种在 60~90° 完全一致，只在 90~180° 分道扬镳。
++// 两种策略下"低位永远 Push::Up（抬，减摩擦）"都不变，区别只在高位。
++enum class Strategy : uint8_t {
++	// 翻过去（默认）：60~90 压高位回正；90~180 抬高位，让机身绕低位棱继续翻过 180°。
++	// 等效于「高位全程反转」，高位在 90° 处不换向。
++	FlipOver = 0,
++
++	// 压回去：60~180 全程压高位，始终朝 0° 方向拉。路径最短，但高位在 90° 处要换向。
++	PressBack = 1,
++};
++
++// 工作区：只用来决定"电机转向怎么换算到机身受力方向"，不承载出力策略。
++enum class Zone : uint8_t {
++	Off = 0,        // < 停止角（默认 60°），完全不出力，靠重力
++	Upright = 1,    // 60°~90°：cos>0，机体 +Z 朝天 -> Normal 受力向上, Reversed 受力向下
++	Inverted = 2,   // 90°~180°：cos<0，机体 +Z 朝地 -> Normal 受力向下, Reversed 受力向上
++};
++
++// 电机几何，来自 PX4 的 CA_ROTOR_COUNT / CA_ROTORn_PX / CA_ROTORn_PY
++struct Layout {
++	bool valid{false};
++	float px[4] {};   // 前为正
++	float py[4] {};   // 右为正
++};
++
++// 低位组的转向模式（调试用，正常飞行用 Auto 即可）
++enum class LowMode : uint8_t {
++	Auto = 0,       // 按倾角自动决定 —— 目标永远是"抬"（卸压/减摩擦）
++	ForceNormal,    // 强制电机正转（Normal），不管倾角
++	ForceReversed,  // 强制电机反转（Reversed），不管倾角
++	Off,            // 低位完全不转
++};
++
++struct Settings {
++	float entry_angle{75.f};     // 进入门限（度）
++	float stop_angle{60.f};      // 停止门限（度），低于它交给重力
++	float thr_high{0.20f};       // 高位组油门（产生力矩的主攻组，全额）
++	float thr_low{0.10f};        // 低位组油门（卸压/减摩擦的辅助组）
++	int32_t low_mode{0};         // 低位转向模式，见 enum LowMode
++	float slew{0.50f};           // 油门上升率 (1/s)
++	float max_time{3.0f};        // 总出力时长上限 (s)
++	float min_progress{3.0f};    // 最短进度要求 (度)
++	float progress_time{0.80f};  // 进度判定起始时间 (s)
++	int32_t strategy{0};         // 0=翻过去（默认）1=压回去，见 enum Strategy
++};
++
++struct Input {
++	uint64_t now{0};
++	bool enabled{false};      // FLIP_EN
++	bool safe{false};         // 综合安全：未解锁、落地、姿态/陀螺有效、（需要时）遥控就绪
++	bool mode_active{false};  // nav_state == NAVIGATION_STATE_FLIP_RECOVERY
++	float q[4] {0.f, 0.f, 0.f, 1.f};
++	float gyro[3] {};         // rad/s，仅用于日志
++};
++
++// 失败原因码，数值与 msg/FlipRecoveryStatus.msg 的 REASON_* 一一对应
++enum ReasonCode : uint8_t {
++	ReasonNone = 0,
++	ReasonTimeout = 1,
++	ReasonNoProgress = 2,
++	ReasonSafetyLost = 3,
++	ReasonModeExited = 4,
++	ReasonAttitudeReset = 5,
++};
++
++struct Plan {
++	bool active{false};
++	uint8_t state{0};         // 与 Plan::State 数值一致，直接写进 uORB 消息
++	Zone zone{Zone::Off};
++	uint8_t fwd_mask{0};      // control[i] > 0 的电机（Normal）
++	uint8_t rev_mask{0};      // control[i] < 0 的电机（Reversed）
++	uint8_t high_mask{0};     // 高位组（主攻），供日志/调试用
++	uint8_t low_mask{0};      // 低位组（辅助/卸压），供日志/调试用
++	// 逐路电机的带符号油门：+ = Normal，- = Reversed，0 = 停。
++	// 必须逐路给：策略 A 的 90~180° 段高/低位同为 Reversed，但油门不同（全额 vs 打折）。
++	float control[4] {};
++	float tilt_deg{0.f};
++	uint8_t reason_code{ReasonNone};   // 失败原因，见 ReasonCode
++	const char *reason{"idle"};
++};
++
++class FlipPlanner
++{
++public:
++	enum class State : uint8_t { Idle = 0, Ramp = 1, Hold = 2, Coast = 3, Done = 4, Failed = 5 };
++
++	Plan update(const Input &in, const Settings &s, const Layout &layout)
++	{
++		Plan out{};
++
++		// ---- 1. 姿态 -> 倾角 ----
++		float alignment = NAN;
++
++		if (!tiltDegrees(in.q, alignment)) {
++			return out;
++		}
++
++		const float tilt = math::degrees(acosf(math::constrain(alignment, -1.f, 1.f)));
++		out.tilt_deg = tilt;
++		_tilt = tilt;
++
++		const matrix::Dcmf R{matrix::Quatf{in.q}};
++
++		// ---- 2. 选"低位桨"（贴地的两路，它们的连线就是翻正转轴） ----
++		uint8_t low = 0, high = 0;
++
++		if (!lowestPair(layout, R, low, high)) {
++			return out;
++		}
++
++		// ---- 3. 模式边沿 ----
++		// 模式退出：任何进行中的会话立即终止，并允许下次重新触发
++		if (!in.mode_active) {
++			if (_state == State::Ramp || _state == State::Hold) {
++				fail("mode exited", ReasonModeExited);
++
++			} else if (_state == State::Coast) {
++				_state = State::Done;
++				_reason = "mode exited while coasting";
++			}
++
++			_rearm_needed = false;
++			_thr = 0.f;
++			out.reason = in.enabled ? "mode off" : "disabled";
++			out.state = static_cast<uint8_t>(_state);
++			return out;
++		}
++
++		// ---- 4. 启动判定 ----
++		if (_state == State::Idle || _state == State::Done || _state == State::Failed) {
++			// Done / Failed 之后必须把模式切出去再切回来，才能开始下一次
++			if (_rearm_needed) {
++				out.reason = "waiting for mode exit before re-arm";
++				out.state = static_cast<uint8_t>(_state);
++				return out;
++			}
++
++			if (!in.enabled) {
++				out.reason = "disabled";
++				out.state = static_cast<uint8_t>(_state);
++				return out;
++			}
++
++			if (!in.safe) {
++				out.reason = "safety blocked";
++				out.state = static_cast<uint8_t>(_state);
++				return out;
++			}
++
++			if (tilt < s.entry_angle) {
++				out.reason = "tilt below entry angle";
++				out.state = static_cast<uint8_t>(_state);
++				return out;
++			}
++
++			_state = State::Ramp;
++			_started = in.now;
++			_start_tilt = tilt;
++			_session = in.now;
++			_thr = 0.f;
++			_reason = "ramping up";
++		}
++
++		// ---- 5. 运行中掉安全条件 -> 直接停 ----
++		if (!in.safe || !in.enabled) {
++			fail("safety lost or disabled", ReasonSafetyLost);
++		}
++
++		// ---- 6. 选择工作区 ----
++		Zone zone = Zone::Off;
++
++		if (tilt >= 90.f) {
++			zone = Zone::Inverted;
++
++		} else if (tilt >= s.stop_angle) {
++			zone = Zone::Upright;
++		}
++
++		// 到达停止角：收油，交给重力
++		if (_state == State::Ramp || _state == State::Hold) {
++			if (tilt <= s.stop_angle) {
++				_state = State::Coast;
++				_coast_started = in.now;
++				_thr = 0.f;
++				_reason = "tilt below stop angle, gravity takes over";
++
++			} else if (in.now - _started >= static_cast<uint64_t>(s.max_time * 1e6f)) {
++				fail("timeout", ReasonTimeout);
++
++			} else if (in.now - _started >= static_cast<uint64_t>(s.progress_time * 1e6f)
++				   && (_start_tilt - tilt) < s.min_progress) {
++				fail("no tilt progress (wrong side or too little throttle)", ReasonNoProgress);
++			}
++		}
++
++		// ---- 7. 目标受力方向 -> 每组电机转向 ----
++		//
++		// 分工原则（两组职责完全不同，不要用同一套逻辑套）：
++		//   高位组 —— 唯一产生翻正力矩的组，力臂最大，所以永远全额油门。
++		//   低位组 —— 就在转轴上，力臂≈0，力矩贡献可忽略；它唯一的作用是
++		//             把机身往上抬一点，减轻对地面的正压力、减小绕轴摩擦。
++		//             若反过来往下压，支点会被压死、摩擦锁住转轴，反而拖累高位。
++		//             所以低位**永远 Push::Up**（抬），只是 90° 前后"抬"对应的电机转向不同。
++		//
++		// 策略 A「翻过去」(默认, strategy=0)：高位全程反转
++		//   60~90  : 高位 Push::Down（压回正） + 低位 Push::Up（抬） -> tilt 减小
++		//   90~180 : 高位 Push::Up  （抬，翻过去）+ 低位 Push::Up（抬） -> tilt 增大
++		// 策略 B「压回去」(strategy=1)：高位全程 Push::Down
++		//   60~180 : 高位 Push::Down（压）+ 低位 Push::Up（抬） -> 始终朝 0° 拉
++		//
++		// 换算：Normal 产生的机身受力方向 = 机体 +Z 的世界指向
++		//   normal_is_up = R(2,2) > 0
++		//   true (tilt<90) : Normal -> Push::Up
++		//   false(tilt>90) : Normal -> Push::Down
++		const bool normal_is_up = (R(2, 2) > 0.f);
++
++		// 高位：默认压回去；选"翻过去"且在 90~180 段时改为抬
++		Push high_push = Push::Down;
++
++		if (zone == Zone::Inverted && static_cast<Strategy>(s.strategy) == Strategy::FlipOver) {
++			high_push = Push::Up;
++		}
++
++		// 低位：Auto 时永远抬（卸压/减摩擦）；调试可强制转向或直接关掉
++		const Push low_push = Push::Up;
++
++		const bool high_normal = ((high_push == Push::Up) == normal_is_up);
++
++		bool low_normal = ((low_push == Push::Up) == normal_is_up);
++		bool low_enabled = true;
++
++		switch (static_cast<LowMode>(s.low_mode)) {
++		case LowMode::ForceNormal:
++			low_normal = true;
++			break;
++
++		case LowMode::ForceReversed:
++			low_normal = false;
++			break;
++
++		case LowMode::Off:
++			low_enabled = false;
++			break;
++
++		case LowMode::Auto:
++		default:
++			break;
++		}
++
++		// ---- 8. 逐路油门 ----
++		// 必须逐电机算：策略 A 的 90~180° 段高/低位同为 Reversed，但油门不同
++		// （高位全额、低位打折），用单一"反转组油门"无法表达。
++		const float dt = (_last_now != 0 && in.now >= _last_now) ? fminf(0.05f, (in.now - _last_now) * 1e-6f) : 0.f;
++		_last_now = in.now;
++
++		const float thr_high = fminf(s.thr_high, HARD_MAX_THROTTLE);
++		const float thr_low  = low_enabled ? fminf(s.thr_low, HARD_MAX_THROTTLE) : 0.f;
++
++		const bool driving_now = (zone != Zone::Off);
++		const float target = driving_now ? fmaxf(thr_high, thr_low) : 0.f;
++
++		if (_state == State::Ramp) {
++			_thr = fminf(target, _thr + s.slew * dt);
++
++			if (_thr >= target) {
++				_state = State::Hold;
++				_reason = "holding";
++			}
++		}
++
++		if (_state == State::Coast) {
++			if (tilt <= s.stop_angle || in.now - _coast_started > 1500000) {
++				_state = State::Done;
++				_rearm_needed = true;
++				_fail_code = ReasonNone;
++				_reason = "done (gravity settling)";
++			}
++
++		} else if (_state == State::Done || _state == State::Failed) {
++			_thr = 0.f;
++		}
++
++		// ---- 9. 组装输出 ----
++		const bool driving = (_state == State::Ramp || _state == State::Hold) && driving_now;
++
++		out.active = _state != State::Idle && _state != State::Done && _state != State::Failed;
++		out.state = static_cast<uint8_t>(_state);
++		out.zone = driving ? zone : Zone::Off;
++		out.high_mask = driving ? high : 0;
++		out.low_mask = (driving && low_enabled) ? low : 0;
++
++		for (unsigned i = 0; i < 4; ++i) {
++			out.control[i] = 0.f;
++
++			if (!driving) {
++				continue;
++			}
++
++			float thr = 0.f;
++			bool normal = false;
++
++			if (high & (1u << i)) {
++				thr = fminf(_thr, thr_high);
++				normal = high_normal;
++
++			} else if (low & (1u << i)) {
++				thr = fminf(_thr, thr_low);
++				normal = low_normal;
++			}
++
++			if (thr > 0.f) {
++				out.control[i] = normal ? thr : -thr;
++
++				if (normal) {
++					out.fwd_mask |= static_cast<uint8_t>(1u << i);
++
++				} else {
++					out.rev_mask |= static_cast<uint8_t>(1u << i);
++				}
++			}
++		}
++
++		out.tilt_deg = tilt;
++		out.reason_code = _fail_code;
++		out.reason = _reason;
++		return out;
++	}
++
++	State state() const { return _state; }
++	const char *reason() const { return _reason; }
++	uint64_t session() const { return _session; }
++	float tilt() const { return _tilt; }
++	float throttle() const { return _thr; }
++
++	void fail(const char *why, uint8_t code = ReasonNone)
++	{
++		_state = State::Failed;
++		_thr = 0.f;
++		_rearm_needed = true;
++		_reason = why;
++		_fail_code = code;
++	}
++
++	// 四元数 -> alignment（R(2,2)）；模长异常返回 false
++	static bool tiltDegrees(const float q[4], float &alignment)
++	{
++		alignment = NAN;
++		matrix::Quatf attitude{q};
++		const float norm = attitude.norm();
++
++		if (!std::isfinite(norm) || fabsf(norm - 1.f) > 0.02f) {
++			return false;
++		}
++
++		attitude.normalize();
++		alignment = matrix::Dcmf{attitude}(2, 2);
++		return true;
++	}
++
++	// 按世界系高度排序，取最低的两路 = 贴地那两路；它们的连线就是翻正转轴，
++	// 剩下两路是高位组（力臂最大，负责产生力矩）
++	static bool lowestPair(const Layout &layout, const matrix::Dcmf &R, uint8_t &low, uint8_t &high)
++	{
++		if (!layout.valid) {
++			return false;
++		}
++
++		float h[4];
++
++		for (unsigned i = 0; i < 4; ++i) {
++			h[i] = R(2, 0) * layout.px[i] + R(2, 1) * layout.py[i];
++		}
++
++		// 选最小的两个（简单插入排序，n=4）
++		unsigned idx[4] {0, 1, 2, 3};
++
++		for (unsigned a = 0; a < 3; ++a) {
++			for (unsigned b = a + 1; b < 4; ++b) {
++				if (h[idx[b]] < h[idx[a]]) {
++					const unsigned t = idx[a];
++					idx[a] = idx[b];
++					idx[b] = t;
++				}
++			}
++		}
++
++		low = static_cast<uint8_t>((1u << idx[0]) | (1u << idx[1]));
++		high = static_cast<uint8_t>(0x0Fu & ~low);
++		return true;
++	}
++
++private:
++	State _state{State::Idle};
++	bool _rearm_needed{false};   // Done/Failed 后置位，模式退出才清零
++	uint8_t _fail_code{ReasonNone};
++	uint64_t _session{0}, _started{0}, _last_now{0}, _coast_started{0};
++	float _start_tilt{0.f}, _thr{0.f}, _tilt{NAN};
++	const char *_reason{"idle"};
++};
++
++} // namespace flip_recovery
+diff --git a/src/lib/mixer_module/mixer_module.cpp b/src/lib/mixer_module/mixer_module.cpp
+index eb67188018..7a7e921208 100644
+--- a/src/lib/mixer_module/mixer_module.cpp
++++ b/src/lib/mixer_module/mixer_module.cpp
+@@ -411,6 +411,15 @@ void MixingOutput::setAllDisarmedValues(uint16_t value)
+ 	}
+ }
+ 
++void MixingOutput::setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS])
++{
++	_recovery_active = active && (outputs != nullptr);
++
++	for (unsigned i = 0; i < MAX_ACTUATORS; i++) {
++		_recovery_outputs[i] = (_recovery_active && outputs != nullptr) ? outputs[i] : NAN;
++	}
++}
++
+ void MixingOutput::unregister()
+ {
+ 	if (_subscription_callback) {
+@@ -448,6 +457,34 @@ bool MixingOutput::update()
+ 	// check for actuator test
+ 	_actuator_test.update(_max_num_outputs, _param_thr_mdl_fac.get());
+ 
++	// 反乌龟直出：与 actuator_test 平行的一条通路，未解锁也允许输出。
++	// 三个前置条件缺一不可：调用方要求接管、车辆确实未解锁、没有 kill/lockdown/termination。
++	// 一旦接管就完全绕开 _functions[]，所以不受 actuator_motors 的 armed 门控影响。
++	if (_recovery_active && !_armed.armed && !_armed.kill && !_armed.lockdown && !_armed.termination) {
++		// 反乌龟不走可逆输出（Bluejay 不支持 3D 油门），方向由驱动层的
++		// DShot 方向命令处理，所以这里强制清掉可逆掩码，避免被当成 3D 编码。
++		_reversible_mask = 0;
++
++		for (int i = 0; i < _max_num_outputs; ++i) {
++			const float value = _recovery_outputs[i];
++
++			// 0 表示该路停转：直接给 disarmed 值。
++			// 不能走 output_limit_calc_single(0)，那会插值成中间油门而不是停转。
++			_current_output_value[i] = (PX4_ISFINITE(value) && value > 0.f)
++						   ? output_limit_calc_single(i, value)
++						   : _disarmed_value[i];
++		}
++
++		if (_interface.updateOutputs(_current_output_value, _max_num_outputs, has_updates)) {
++			actuator_outputs_s actuator_outputs{};
++			setAndPublishActuatorOutputs(_max_num_outputs, actuator_outputs);
++			updateLatencyPerfCounter(actuator_outputs);
++		}
++
++		_was_all_disabled = false;
++		return true;
++	}
++
+ 	// get output values
+ 	float outputs[MAX_ACTUATORS];
+ 	bool all_disabled = true;
+diff --git a/src/lib/mixer_module/mixer_module.hpp b/src/lib/mixer_module/mixer_module.hpp
+index 4fdc0f2904..3cd3ee87f7 100644
+--- a/src/lib/mixer_module/mixer_module.hpp
++++ b/src/lib/mixer_module/mixer_module.hpp
+@@ -170,6 +170,20 @@ public:
+ 	void setAllCenterValues(uint16_t value);
+ 	void setAllMaxValues(uint16_t value);
+ 
++	/**
++	 * 反乌龟 / 地面翻正专用：未解锁时也强制输出（仅供 flip_recovery 使用）。
++	 *
++	 * 与 actuator_test 的区别：多路协同、无超时、由调用方每周期刷新。
++	 * 只在该组条件全部满足时生效，否则完全不接管：
++	 *   active && !armed && !kill && !lockdown && !termination
++	 *
++	 * @param outputs 归一化**绝对**油门 [0,1]，0 表示该路停转。
++	 *                方向由调用方（DShot 驱动）另行通过方向命令处理，
++	 *                这里不做符号解释，也不走 _functions[]。
++	 */
++	void setRecoveryOutputs(bool active, const float outputs[MAX_ACTUATORS]);
++	bool recoveryActive() const { return _recovery_active; }
++
+ 	/** Disarmed values: disarmedValue < minValue needs to hold */
+ 	uint16_t &disarmedValue(int index) { return _disarmed_value[index]; }
+ 	uint16_t &minValue(int index) { return _min_value[index]; }
+@@ -292,6 +306,10 @@ private:
+ 	uint32_t _reversible_mask{0}; ///< per-output bits. If set, the output is configured to be reversible (motors only)
+ 	bool _was_all_disabled{false};
+ 
++	// 反乌龟直出（见 setRecoveryOutputs 注释）
++	bool _recovery_active{false};
++	float _recovery_outputs[MAX_ACTUATORS] {};
++
+ 	uORB::SubscriptionCallbackWorkItem *_subscription_callback{nullptr}; ///< current scheduling callback
+ 
+ 
+diff --git a/src/lib/modes/ui.hpp b/src/lib/modes/ui.hpp
+index e81a3609ad..83736a0f5b 100644
+--- a/src/lib/modes/ui.hpp
++++ b/src/lib/modes/ui.hpp
+@@ -62,7 +62,8 @@ static inline uint32_t getValidNavStates()
+ 	       (1u << vehicle_status_s::NAVIGATION_STATE_AUTO_FOLLOW_TARGET) |
+ 	       (1u << vehicle_status_s::NAVIGATION_STATE_AUTO_PRECLAND) |
+ 	       (1u << vehicle_status_s::NAVIGATION_STATE_ORBIT) |
+-	       (1u << vehicle_status_s::NAVIGATION_STATE_AUTO_VTOL_TAKEOFF);
++	       (1u << vehicle_status_s::NAVIGATION_STATE_AUTO_VTOL_TAKEOFF) |
++	       (1u << vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY);
+ 
+ 	static_assert(vehicle_status_s::NAVIGATION_STATE_MAX  == 31, "update valid nav states");
+ }
+@@ -84,7 +85,7 @@ const char *const nav_state_names[vehicle_status_s::NAVIGATION_STATE_MAX] = {
+ 	"Termination",
+ 	"Offboard",
+ 	"Stabilized",
+-	"16: UNUSED2",
++	"Flip Recovery",
+ 	"Takeoff",
+ 	"Land",
+ 	"Follow Target",
+diff --git a/src/modules/commander/Commander.cpp b/src/modules/commander/Commander.cpp
+index 663223c9bf..802ce89c24 100644
+--- a/src/modules/commander/Commander.cpp
++++ b/src/modules/commander/Commander.cpp
+@@ -404,6 +404,10 @@ int Commander::custom_command(int argc, char *argv[])
+ 			} else if (!strcmp(argv[1], "stabilized")) {
+ 				send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_STABILIZED);
+ 
++			} else if (!strcmp(argv[1], "flip")) {
++				// 倾角翻正模式：与遥控拨杆、MAVLink SET_MODE 走同一条路径
++				send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY);
++
+ 			} else if (!strcmp(argv[1], "auto:takeoff")) {
+ 				send_vehicle_command(vehicle_command_s::VEHICLE_CMD_DO_SET_MODE, 1, PX4_CUSTOM_MAIN_MODE_AUTO,
+ 						     PX4_CUSTOM_SUB_MODE_AUTO_TAKEOFF);
+@@ -882,6 +886,9 @@ Commander::handle_command(const vehicle_command_s &cmd)
+ 				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_STABILIZED) {
+ 					desired_nav_state = vehicle_status_s::NAVIGATION_STATE_STAB;
+ 
++				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY) {
++					desired_nav_state = vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY;
++
+ 				} else if (custom_main_mode == PX4_CUSTOM_MAIN_MODE_OFFBOARD) {
+ 					desired_nav_state = vehicle_status_s::NAVIGATION_STATE_OFFBOARD;
+ 				}
+@@ -3050,7 +3057,7 @@ The commander module contains the state machine for mode switching and failsafe
+ 	PRINT_MODULE_USAGE_COMMAND("land");
+ 	PRINT_MODULE_USAGE_COMMAND_DESCR("transition", "VTOL transition");
+ 	PRINT_MODULE_USAGE_COMMAND_DESCR("mode", "Change flight mode");
+-	PRINT_MODULE_USAGE_ARG("manual|acro|offboard|stabilized|altctl|posctl|altitude_cruise|position:slow|auto:mission|auto:loiter|auto:rtl|auto:takeoff|auto:land|auto:precland|ext1",
++	PRINT_MODULE_USAGE_ARG("manual|acro|offboard|stabilized|flip|altctl|posctl|altitude_cruise|position:slow|auto:mission|auto:loiter|auto:rtl|auto:takeoff|auto:land|auto:precland|ext1",
+ 			"Flight mode", false);
+ 	PRINT_MODULE_USAGE_COMMAND("pair");
+ 	PRINT_MODULE_USAGE_COMMAND("termination");
+diff --git a/src/modules/commander/ModeUtil/control_mode.cpp b/src/modules/commander/ModeUtil/control_mode.cpp
+index 59858a51e8..af58de1d3d 100644
+--- a/src/modules/commander/ModeUtil/control_mode.cpp
++++ b/src/modules/commander/ModeUtil/control_mode.cpp
+@@ -62,6 +62,12 @@ void getVehicleControlMode(uint8_t nav_state, uint8_t vehicle_type,
+ 		vehicle_control_mode.flag_control_allocation_enabled = true;
+ 		break;
+ 
++	case vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY:
++		// 翻正模式不使用任何控制器：所有 flag 保持 false。
++		// 电机输出由 flip_recovery 模块独占（control_allocator 在该模式下让位），
++		// 因此这里既不置 attitude/rate，也不置 allocation。
++		break;
++
+ 	case vehicle_status_s::NAVIGATION_STATE_ALTCTL:
+ 	case vehicle_status_s::NAVIGATION_STATE_ALTITUDE_CRUISE:
+ 		vehicle_control_mode.flag_control_manual_enabled = true;
+diff --git a/src/modules/commander/ModeUtil/mode_requirements.cpp b/src/modules/commander/ModeUtil/mode_requirements.cpp
+index 850a0cf6e9..6bb3770093 100644
+--- a/src/modules/commander/ModeUtil/mode_requirements.cpp
++++ b/src/modules/commander/ModeUtil/mode_requirements.cpp
+@@ -162,6 +162,14 @@ void getModeRequirements(uint8_t vehicle_type, failsafe_flags_s &flags)
+ 	setRequirement(vehicle_status_s::NAVIGATION_STATE_STAB, flags.mode_req_attitude);
+ 	setRequirement(vehicle_status_s::NAVIGATION_STATE_STAB, flags.mode_req_manual_control);
+ 
++	// NAVIGATION_STATE_FLIP_RECOVERY
++	// 需要姿态 + 角速度才能算倾角和电机相对地面高度；需要遥控以便随时拨杆退出。
++	// mode_req_prevent_arming：该模式只允许在地面未解锁时使用，绝不允许带着翻正模式起飞。
++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_angular_velocity);
++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_attitude);
++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_manual_control);
++	setRequirement(vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY, flags.mode_req_prevent_arming);
++
+ 	// NAVIGATION_STATE_AUTO_TAKEOFF
+ 	setRequirement(vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF, flags.mode_req_angular_velocity);
+ 	setRequirement(vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF, flags.mode_req_attitude);
+diff --git a/src/modules/commander/module.yaml b/src/modules/commander/module.yaml
+index 67f97e3a7e..5906d93462 100644
+--- a/src/modules/commander/module.yaml
++++ b/src/modules/commander/module.yaml
+@@ -39,6 +39,7 @@ parameters:
+                 12: Follow Me
+                 13: Precision Land
+                 16: Altitude Cruise
++                17: Flip Recovery
+                 100: External Mode 1
+                 101: External Mode 2
+                 102: External Mode 3
+diff --git a/src/modules/commander/px4_custom_mode.h b/src/modules/commander/px4_custom_mode.h
+index fc901d1492..f159453cf5 100644
+--- a/src/modules/commander/px4_custom_mode.h
++++ b/src/modules/commander/px4_custom_mode.h
+@@ -52,7 +52,8 @@ enum PX4_CUSTOM_MAIN_MODE {
+ 	PX4_CUSTOM_MAIN_MODE_RATTITUDE_LEGACY,
+ 	PX4_CUSTOM_MAIN_MODE_SIMPLE, /* unused, but reserved for future use */
+ 	PX4_CUSTOM_MAIN_MODE_TERMINATION,
+-	PX4_CUSTOM_MAIN_MODE_ALTITUDE_CRUISE
++	PX4_CUSTOM_MAIN_MODE_ALTITUDE_CRUISE,
++	PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY /* 12: tilt flip recovery, added for MicoAir743v2 */
+ };
+ 
+ enum PX4_CUSTOM_SUB_MODE_AUTO {
+@@ -162,6 +163,10 @@ static inline union px4_custom_mode get_px4_custom_mode(uint8_t nav_state)
+ 		custom_mode.main_mode = PX4_CUSTOM_MAIN_MODE_STABILIZED;
+ 		break;
+ 
++	case vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY:
++		custom_mode.main_mode = PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY;
++		break;
++
+ 	case vehicle_status_s::NAVIGATION_STATE_AUTO_TAKEOFF:
+ 		custom_mode.main_mode = PX4_CUSTOM_MAIN_MODE_AUTO;
+ 		custom_mode.sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_TAKEOFF;
+diff --git a/src/modules/flip_recovery/CMakeLists.txt b/src/modules/flip_recovery/CMakeLists.txt
+new file mode 100644
+index 0000000000..d0c1826f3a
+--- /dev/null
++++ b/src/modules/flip_recovery/CMakeLists.txt
+@@ -0,0 +1,11 @@
++px4_add_module(
++	MODULE modules__flip_recovery
++	MAIN flip_recovery
++	STACK_MAIN 2048
++	SRCS
++		FlipRecovery.cpp
++		FlipRecovery.hpp
++	DEPENDS
++		px4_work_queue
++		mathlib
++	)
+diff --git a/src/modules/flip_recovery/FlipRecovery.cpp b/src/modules/flip_recovery/FlipRecovery.cpp
+new file mode 100644
+index 0000000000..16b0ddd7f9
+--- /dev/null
++++ b/src/modules/flip_recovery/FlipRecovery.cpp
+@@ -0,0 +1,462 @@
++/****************************************************************************
++ * flip_recovery 主模块
++ *
++ * 这个文件只做四件事：
++ *   1. 判断当前是否处于 NAVIGATION_STATE_FLIP_RECOVERY 模式
++ *   2. 汇总安全条件（未解锁 / 落地 / 姿态有效 / 可选遥控二次确认）
++ *   3. 调 FlipPlanner 算出「哪几路正转、哪几路反转、油门多少」
++ *   4. 把结果发布成 flip_recovery_control（以及可选的 actuator_motors 直出）
++ ****************************************************************************/
++#include "FlipRecovery.hpp"
++
++#include <commander/px4_custom_mode.h>
++#include <drivers/drv_hrt.h>
++#include <mathlib/mathlib.h>
++#include <parameters/param.h>
++
++using namespace time_literals;
++
++FlipRecovery::FlipRecovery() :
++	ModuleParams(nullptr),
++	ScheduledWorkItem(MODULE_NAME, px4::wq_configurations::lp_default)
++{
++	updateLayout();
++}
++
++// 从 PX4 自己的电机配置里读几何：CA_ROTOR_COUNT / CA_ROTORn_PX / CA_ROTORn_PY
++// 这样"电机号"始终和 PX4 里的定义一致，不需要另外维护映射表
++void FlipRecovery::updateLayout()
++{
++	_layout.valid = false;
++
++	int32_t rotor_count = 0;
++
++	if (param_get(param_find("CA_ROTOR_COUNT"), &rotor_count) != PX4_OK || rotor_count != 4) {
++		return;
++	}
++
++	for (unsigned i = 0; i < 4; ++i) {
++		char name[17];
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PX", i);
++
++		if (param_get(param_find(name), &_layout.px[i]) != PX4_OK) {
++			return;
++		}
++
++		snprintf(name, sizeof(name), "CA_ROTOR%u_PY", i);
++
++		if (param_get(param_find(name), &_layout.py[i]) != PX4_OK) {
++			return;
++		}
++	}
++
++	_layout.valid = true;
++}
++
++// FLIP_RC_CONFIRM = 1..6 时返回对应 aux 通道值，0 返回 NAN
++float FlipRecovery::auxInput() const
++{
++	switch (_param_rc_confirm.get()) {
++	case 1: return _manual.aux1;
++	case 2: return _manual.aux2;
++	case 3: return _manual.aux3;
++	case 4: return _manual.aux4;
++	case 5: return _manual.aux5;
++	case 6: return _manual.aux6;
++	default: return NAN;
++	}
++}
++
++// COM_FLTMODE 的枚举编号 -> PX4 custom mode。只覆盖地面翻正可能用到的几个模式
++static bool modeFromParam(int32_t value, uint8_t &main_mode, uint8_t &sub_mode)
++{
++	sub_mode = 0;
++
++	switch (value) {
++	case 0: main_mode = PX4_CUSTOM_MAIN_MODE_MANUAL; return true;
++	case 1: main_mode = PX4_CUSTOM_MAIN_MODE_ALTCTL; return true;
++	case 2: main_mode = PX4_CUSTOM_MAIN_MODE_POSCTL; return true;
++	case 3: main_mode = PX4_CUSTOM_MAIN_MODE_AUTO; sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_MISSION; return true;
++	case 4: main_mode = PX4_CUSTOM_MAIN_MODE_AUTO; sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_LOITER; return true;
++	case 5: main_mode = PX4_CUSTOM_MAIN_MODE_AUTO; sub_mode = PX4_CUSTOM_SUB_MODE_AUTO_RTL; return true;
++	case 6: main_mode = PX4_CUSTOM_MAIN_MODE_ACRO; return true;
++	case 7: main_mode = PX4_CUSTOM_MAIN_MODE_OFFBOARD; return true;
++	case 8: main_mode = PX4_CUSTOM_MAIN_MODE_STABILIZED; return true;
++	default: return false;
++	}
++}
++
++void FlipRecovery::Run()
++{
++	if (should_exit()) {
++		ScheduleClear();
++		exit_and_cleanup();
++		return;
++	}
++
++	if (_parameter_update_sub.updated()) {
++		parameter_update_s update;
++		_parameter_update_sub.copy(&update);
++		updateParams();
++		updateLayout();
++	}
++
++	_manual_sub.update(&_manual);
++	_attitude_sub.update(&_attitude);
++	_angular_velocity_sub.update(&_angular_velocity);
++	_status_sub.update(&_status);
++	_land_sub.update(&_land);
++	_armed_sub.update(&_armed);
++
++	const hrt_abstime now = hrt_absolute_time();
++
++	// ---------- 模式判定：只看 nav_state，不关心是谁切的 ----------
++	_mode_active = (_status.nav_state == vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY);
++
++	if (!_mode_active) {
++		_exit_requested = false;   // 退出模式后允许下一次进入时重新触发
++	}
++
++	// ---------- 数据有效性 ----------
++	_attitude_valid = fresh(now, _attitude.timestamp_sample, 100_ms);
++	_gyro_valid = fresh(now, _angular_velocity.timestamp_sample, 100_ms);
++
++	float alignment = NAN;
++
++	if (_attitude_valid) {
++		_attitude_valid = flip_recovery::FlipPlanner::tiltDegrees(_attitude.q, alignment);
++		_tilt = _attitude_valid ? math::degrees(acosf(math::constrain(alignment, -1.f, 1.f))) : NAN;
++
++	} else {
++		_tilt = NAN;
++	}
++
++	_rc_ready = _manual.valid && fresh(now, _manual.timestamp_sample, 1_s);
++
++	// 可选二次确认：FLIP_RC_CONFIRM = 1..6 时必须把对应 aux 通道打到高位
++	bool confirm_ok = true;
++
++	if (_param_rc_confirm.get() > 0) {
++		const float aux = auxInput();
++		confirm_ok = _rc_ready && PX4_ISFINITE(aux) && aux > 0.5f;
++	}
++
++	// 有遥控在线时要求油门摇杆放到最低，避免用户一边推油门一边翻正
++	bool throttle_ok = true;
++
++	if (_rc_ready && PX4_ISFINITE(_manual.throttle)) {
++		throttle_ok = _manual.throttle < -0.8f;
++	}
++
++	// ---------- 安全门限（任一不满足立即停） ----------
++	// 注意：这里不看 failsafe —— 纯上位机触发时可能没有遥控，failsafe 会一直亮，
++	// 但未解锁就飞不起来，安全性由 armed 状态保证。
++	_safe = _attitude_valid
++		&& _gyro_valid
++		&& _layout.valid
++		&& fresh(now, _land.timestamp, 2_s) && _land.landed
++		&& fresh(now, _armed.timestamp, 2_s)
++		&& !_armed.armed && !_armed.kill && !_armed.lockdown && !_armed.termination
++		&& !_armed.in_esc_calibration_mode
++		&& fresh(now, _status.timestamp, 2_s)
++		&& _status.arming_state != vehicle_status_s::ARMING_STATE_ARMED
++		&& confirm_ok
++		&& throttle_ok;
++
++	// 姿态被外部重置（重定位/切换估计器）时，放弃本次会话
++	if (_planner.state() != flip_recovery::FlipPlanner::State::Idle
++	    && _quat_reset != _attitude.quat_reset_counter) {
++		_planner.fail("attitude reset during recovery", flip_recovery::ReasonAttitudeReset);
++	}
++
++	if (_planner.state() == flip_recovery::FlipPlanner::State::Idle
++	    || _planner.state() == flip_recovery::FlipPlanner::State::Done
++	    || _planner.state() == flip_recovery::FlipPlanner::State::Failed) {
++		_quat_reset = _attitude.quat_reset_counter;
++	}
++
++	// ---------- 参数 -> 规划器设置 ----------
++	flip_recovery::Settings settings{};
++	settings.entry_angle = _param_entry_ang.get();
++	settings.stop_angle = _param_stop_ang.get();
++	settings.thr_high = _param_thr_high.get();
++	settings.thr_low = _param_thr_low.get();
++	settings.low_mode = _param_low_mode.get();
++	settings.slew = _param_slew.get();
++	settings.max_time = _param_time.get();
++	settings.min_progress = _param_min_prog.get();
++	settings.progress_time = _param_prog_t.get();
++	settings.strategy = _param_mode.get();
++
++	// 参数合法性兜底
++	const bool settings_valid = PX4_ISFINITE(settings.entry_angle) && settings.entry_angle > settings.stop_angle
++				    && settings.entry_angle <= 180.f && settings.stop_angle >= 0.f
++				    && PX4_ISFINITE(settings.thr_high) && settings.thr_high > 0.f
++				    && settings.thr_high <= flip_recovery::HARD_MAX_THROTTLE
++				    && PX4_ISFINITE(settings.thr_low) && settings.thr_low >= 0.f
++				    && settings.thr_low <= flip_recovery::HARD_MAX_THROTTLE
++				    && settings.low_mode >= 0 && settings.low_mode <= 3
++				    && PX4_ISFINITE(settings.slew) && settings.slew > 0.01f && settings.slew <= 2.f
++				    && PX4_ISFINITE(settings.max_time) && settings.max_time > 0.2f && settings.max_time <= 5.f;
++
++	flip_recovery::Input in{};
++	in.now = now;
++	in.enabled = _param_en.get() && settings_valid;
++	in.safe = _safe;
++	in.mode_active = _mode_active;
++	in.gyro[0] = _angular_velocity.xyz[0];
++	in.gyro[1] = _angular_velocity.xyz[1];
++	in.gyro[2] = _angular_velocity.xyz[2];
++
++	for (unsigned i = 0; i < 4; ++i) {
++		in.q[i] = _attitude.q[i];
++	}
++
++	const auto previous = _planner.state();
++	_plan = _planner.update(in, settings, _layout);
++
++	if (previous != _planner.state()) {
++		PX4_INFO("flip state %u: %s (tilt %.1f)", static_cast<unsigned>(_planner.state()), _planner.reason(),
++			 (double)_tilt);
++
++		// 给上位机的结果：只有 Done 才算成功，Failed 带原因码
++		if (_planner.state() == flip_recovery::FlipPlanner::State::Ramp) {
++			_session_start = now;
++			_result = flip_recovery_status_s::RESULT_NONE;
++			_duration = 0.f;
++
++		} else if (_planner.state() == flip_recovery::FlipPlanner::State::Done) {
++			_result = flip_recovery_status_s::RESULT_SUCCESS;
++			_duration = (_session_start != 0 && now >= _session_start) ? (now - _session_start) * 1e-6f : 0.f;
++
++		} else if (_planner.state() == flip_recovery::FlipPlanner::State::Failed) {
++			_result = flip_recovery_status_s::RESULT_FAILED;
++			_duration = (_session_start != 0 && now >= _session_start) ? (now - _session_start) * 1e-6f : 0.f;
++		}
++	}
++
++	// 工作区切换时打印一次"谁在往哪推"，方便台架上直接核对
++	if (_plan.zone != _last_zone) {
++		_last_zone = _plan.zone;
++
++		if (_plan.zone != flip_recovery::Zone::Off) {
++			// 逐路 control 才是权威值；掩码只是它的符号摘要
++			double thr_high = 0.0;
++
++			for (unsigned i = 0; i < 4; ++i) {
++				if (_plan.high_mask & (1u << i)) {
++					thr_high = fabs((double)_plan.control[i]);
++				}
++			}
++
++			double thr_low = 0.0;
++
++			for (unsigned i = 0; i < 4; ++i) {
++				if (_plan.low_mask & (1u << i)) {
++					thr_low = fabs((double)_plan.control[i]);
++				}
++			}
++
++			const bool high_normal = (_plan.fwd_mask & _plan.high_mask) != 0;
++			const bool low_normal  = (_plan.fwd_mask & _plan.low_mask) != 0;
++
++			// 高位在抬还是压：策略 A 的 90~180° 段高位是"抬"（Push::Up）
++			const bool high_lifts = (_plan.zone == flip_recovery::Zone::Inverted) && (_param_mode.get() == 0);
++
++			PX4_INFO("flip zone %u (tilt %.0f): HIGH(m%02x) %s @ %.2f %s | LOW(m%02x) %s @ %.2f",
++				 static_cast<unsigned>(_plan.zone), (double)_tilt,
++				 _plan.high_mask, high_normal ? "normal" : "reversed", thr_high,
++				 high_lifts ? "[lifts]" : "[presses]",
++				 _plan.low_mask, low_normal ? "normal" : "reversed", thr_low);
++
++		} else {
++			PX4_INFO("flip zone off (tilt %.0f)", (double)_tilt);
++		}
++	}
++
++	// 翻正结束（成功或失败）且仍停留在该模式 -> 自动切回 FLIP_EXIT_MODE
++	if (_mode_active && !_exit_requested
++	    && (_planner.state() == flip_recovery::FlipPlanner::State::Done
++		|| _planner.state() == flip_recovery::FlipPlanner::State::Failed)) {
++		requestExitMode();
++	}
++
++	publishControl(_plan, _param_out_direct.get());
++	publishStatus(_plan);
++}
++
++void FlipRecovery::requestExitMode()
++{
++	_exit_requested = true;
++
++	uint8_t main_mode = PX4_CUSTOM_MAIN_MODE_POSCTL;
++	uint8_t sub_mode = 0;
++
++	if (!modeFromParam(_param_exit_mode.get(), main_mode, sub_mode)) {
++		main_mode = PX4_CUSTOM_MAIN_MODE_POSCTL;
++		sub_mode = 0;
++	}
++
++	vehicle_command_s cmd{};
++	cmd.timestamp = hrt_absolute_time();
++	cmd.command = vehicle_command_s::VEHICLE_CMD_DO_SET_MODE;
++	cmd.param1 = 1.f;   // VEHICLE_MODE_FLAG_CUSTOM_MODE_ENABLED
++	cmd.param2 = static_cast<float>(main_mode);
++	cmd.param3 = static_cast<float>(sub_mode);
++	cmd.target_system = _status.system_id;
++	cmd.target_component = _status.component_id;
++	cmd.source_system = _status.system_id;
++	cmd.source_component = _status.component_id;
++	_command_pub.publish(cmd);
++
++	PX4_INFO("flip done, switching back to mode %" PRId32, _param_exit_mode.get());
++}
++
++void FlipRecovery::publishControl(const flip_recovery::Plan &plan, bool direct)
++{
++	// 1) 对外的控制请求（给 DShot 后端：逐路带符号油门，负值 = 需要反向）
++	flip_recovery_control_s msg{};
++	msg.timestamp = hrt_absolute_time();
++	msg.session_id = _planner.session();
++	// 只有在真有掩码时才请求 DRIVE；Coast/Done 阶段一律发 STOP，让后端恢复方向
++	const bool driving = plan.active && (plan.fwd_mask || plan.rev_mask) && plan.zone != flip_recovery::Zone::Off;
++	msg.state = plan.state;
++	msg.action = driving ? flip_recovery_control_s::ACTION_DRIVE : flip_recovery_control_s::ACTION_STOP;
++	msg.zone = static_cast<uint8_t>(plan.zone);
++	msg.fwd_mask = plan.fwd_mask;
++	msg.rev_mask = plan.rev_mask;
++	msg.tilt_deg = plan.tilt_deg;
++
++	for (unsigned i = 0; i < 4; ++i) {
++		msg.control[i] = plan.control[i];
++	}
++
++	_control_pub.publish(msg);
++
++	// 2) 台架直出（FLIP_OUT_DIRECT=1）
++	//    该模式下 control_allocator 已让位（allocation flag = false），不会抢这个话题
++	//    负值表示反向推力，需要后端支持可逆输出；DShot 驱动在未解锁时仍会输出
++	//    disarmed 值，所以真实桨转还需要驱动层改造（见 IMPLEMENTATION.md 第 6 节）
++	if (direct) {
++		actuator_motors_s m{};
++		m.timestamp = msg.timestamp;
++		m.timestamp_sample = msg.timestamp;
++
++		for (unsigned i = 0; i < actuator_motors_s::NUM_CONTROLS; ++i) {
++			m.control[i] = NAN;
++		}
++
++		for (unsigned i = 0; i < 4; ++i) {
++			m.control[i] = plan.control[i];
++		}
++
++		_motors_pub.publish(m);
++	}
++}
++
++// 给上位机的执行结果。上位机订阅本话题，等 result 从 NONE 变成 SUCCESS/FAILED
++// 就可以发下一步（解锁、起飞、切模式…），不需要轮询 nav_state 或翻日志。
++void FlipRecovery::publishStatus(const flip_recovery::Plan &plan)
++{
++	flip_recovery_status_s msg{};
++	msg.timestamp = hrt_absolute_time();
++	msg.session_id = _planner.session();
++	msg.state = plan.state;
++	msg.result = _result;
++	msg.reason = plan.reason_code;
++	msg.tilt_deg = plan.tilt_deg;
++	msg.duration_s = _duration;
++	msg.mode_active = _mode_active;
++	_flip_status_pub.publish(msg);
++}
++
++int FlipRecovery::print_status()
++{
++	PX4_INFO("enabled: %s, mode active: %s, state %u: %s", _param_en.get() ? "yes" : "no",
++		 _mode_active ? "yes" : "no",
++		 static_cast<unsigned>(_planner.state()), _planner.reason());
++	PX4_INFO("tilt: %.1f deg, entry %.1f, stop %.1f, strategy %" PRId32 " (%s)",
++		 (double)_tilt, (double)_param_entry_ang.get(), (double)_param_stop_ang.get(), _param_mode.get(),
++		 _param_mode.get() == 0 ? "flip over" : "press back");
++	PX4_INFO("throttle: high %.2f, low %.2f (mode %" PRId32 "), slew %.2f/s, drive time %.1f s",
++		 (double)_param_thr_high.get(), (double)_param_thr_low.get(), _param_low_mode.get(),
++		 (double)_param_slew.get(), (double)_param_time.get());
++	PX4_INFO("masks: fwd 0x%02x, rev 0x%02x, zone %u", _plan.fwd_mask, _plan.rev_mask,
++		 static_cast<unsigned>(_plan.zone));
++	PX4_INFO("safety: %s, RC confirm: ch %" PRId32 " %s, layout: %s",
++		 _safe ? "OK" : "BLOCKED", _param_rc_confirm.get(), _rc_ready ? "ready" : "no RC",
++		 _layout.valid ? "4 rotors" : "unsupported");
++	PX4_INFO("exit mode param: %" PRId32, _param_exit_mode.get());
++
++	if (_layout.valid) {
++		for (unsigned i = 0; i < 4; ++i) {
++			PX4_INFO("Motor %u: PX=%.3f PY=%.3f", i + 1, (double)_layout.px[i], (double)_layout.py[i]);
++		}
++	}
++
++	return PX4_OK;
++}
++
++int FlipRecovery::task_spawn(int argc, char *argv[])
++{
++	FlipRecovery *instance = new FlipRecovery();
++
++	if (instance) {
++		_object.store(instance);
++		_task_id = task_id_is_work_queue;
++		instance->ScheduleOnInterval(20_ms);
++		return PX4_OK;
++	}
++
++	return PX4_ERROR;
++}
++
++int FlipRecovery::print_usage(const char *reason)
++{
++	if (reason) {
++		PX4_WARN("%s", reason);
++	}
++
++	PRINT_MODULE_DESCRIPTION(R"DESCR_STR(
++### Description
++Tilt flip recovery for quad-X (60-180 deg), driven by a dedicated flight mode.
++
++This module does nothing on its own: it only becomes active while
++vehicle_status.nav_state == NAVIGATION_STATE_FLIP_RECOVERY. That mode can be
++entered from three places, all of which end up in the same nav_state:
++
++  - RC switch: set a mode slot to "Flip Recovery" (COM_FLTMODE<n> = 17)
++  - MAVLink:   SET_MODE / MAV_CMD_DO_SET_MODE with custom main mode 12
++  - Console:   commander mode flip
++
++Once active it uses the attitude quaternion to find the two lowest motors,
++which define the roll axis (the edge resting on the ground). The high pair has
++the largest lever arm and does all the work; the low pair sits on the axis, so
++it only lifts slightly to unload the contact and reduce friction.
++
++  - tilt  60.. 90 deg: high pair presses down (mode "press back" would end here)
++  - tilt  90..180 deg: high pair lifts, rolling the frame over 180 deg
++                       (FLIP_MODE=0, default) or keeps pressing down (FLIP_MODE=1)
++  - tilt below the stop angle: cut throttle and let gravity settle it
++
++FLIP_THR_HIGH / FLIP_THR_LOW set the two groups independently; FLIP_LOW_MODE
++can force the low pair normal/reversed or turn it off for bench comparison.
++
++The mode can never be armed (mode_req_prevent_arming), so this always runs on
++the ground with the vehicle disarmed. When the recovery is done or has failed
++the module sends VEHICLE_CMD_DO_SET_MODE to return to FLIP_EXIT_MODE.
++
++Requires an output backend that can reverse motor direction (DShot command
++20/21 or 3D throttle). FLIP_OUT_DIRECT=1 publishes actuator_motors directly for
++bench testing.
++)DESCR_STR");
++	PRINT_MODULE_USAGE_NAME("flip_recovery", "system");
++	PRINT_MODULE_USAGE_COMMAND("start");
++	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
++	return PX4_OK;
++}
++
++extern "C" __EXPORT int flip_recovery_main(int argc, char *argv[])
++{
++	return FlipRecovery::main(argc, argv);
++}
+diff --git a/src/modules/flip_recovery/FlipRecovery.hpp b/src/modules/flip_recovery/FlipRecovery.hpp
+new file mode 100644
+index 0000000000..67b0d55f20
+--- /dev/null
++++ b/src/modules/flip_recovery/FlipRecovery.hpp
+@@ -0,0 +1,120 @@
++/****************************************************************************
++ * flip_recovery —— 倾角翻正（75°~180°）
++ *
++ * 触发方式（v2，模式驱动）：
++ *   1) 遥控器拨杆：把某个模式槽位 COM_FLTMODE<n> 设为 "Flip Recovery"（值 17）
++ *   2) 上位机话题：vehicle_command 发 VEHICLE_CMD_DO_SET_MODE
++ *      (param1=1, param2=PX4_CUSTOM_MAIN_MODE_FLIP_RECOVERY=12)
++ *   3) 上位机 MAVLink：SET_MODE / MAV_CMD_DO_SET_MODE（与 2 同一条链路）
++ *   4) 命令行：commander mode flip
++ *   四条路径最终都落到 vehicle_status.nav_state == NAVIGATION_STATE_FLIP_RECOVERY，
++ *   本模块只订阅 vehicle_status，不关心是谁切的。
++ *
++ * 安全模型：
++ *   - 只允许未解锁（disarmed）时出力；一旦 armed 立即停
++ *   - 进入该模式本身禁止解锁（mode_req_prevent_arming）
++ *   - 任何安全条件丢失立即停止，且必须退出再进入模式才能重试
++ *   - 完成后自动切回 FLIP_EXIT_MODE
++ ****************************************************************************/
++#pragma once
++
++#include <px4_platform_common/module.h>
++#include <px4_platform_common/module_params.h>
++#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
++#include <uORB/Publication.hpp>
++#include <uORB/Subscription.hpp>
++#include <uORB/SubscriptionInterval.hpp>
++#include <uORB/topics/actuator_armed.h>
++#include <uORB/topics/actuator_motors.h>
++#include <uORB/topics/flip_recovery_control.h>
++#include <uORB/topics/flip_recovery_status.h>
++#include <uORB/topics/manual_control_setpoint.h>
++#include <uORB/topics/parameter_update.h>
++#include <uORB/topics/vehicle_angular_velocity.h>
++#include <uORB/topics/vehicle_attitude.h>
++#include <uORB/topics/vehicle_command.h>
++#include <uORB/topics/vehicle_land_detected.h>
++#include <uORB/topics/vehicle_status.h>
++
++#include <flip_recovery/FlipPlanner.hpp>
++
++class FlipRecovery : public ModuleBase<FlipRecovery>, public ModuleParams, public px4::ScheduledWorkItem
++{
++public:
++	FlipRecovery();
++	~FlipRecovery() override = default;
++
++	static int task_spawn(int argc, char *argv[]);
++	static int custom_command(int argc, char *argv[]) { return print_usage("unknown command"); }
++	static int print_usage(const char *reason = nullptr);
++	int print_status() override;
++
++private:
++	void Run() override;
++	void updateLayout();
++	void publishControl(const flip_recovery::Plan &plan, bool dry_run);
++	void publishStatus(const flip_recovery::Plan &plan);
++	void requestExitMode();
++	float auxInput() const;
++
++	static bool fresh(hrt_abstime now, hrt_abstime timestamp, hrt_abstime timeout)
++	{
++		return timestamp != 0 && now >= timestamp && now - timestamp <= timeout;
++	}
++
++	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
++	uORB::Subscription _manual_sub{ORB_ID(manual_control_setpoint)};
++	uORB::Subscription _attitude_sub{ORB_ID(vehicle_attitude)};
++	uORB::Subscription _angular_velocity_sub{ORB_ID(vehicle_angular_velocity)};
++	uORB::Subscription _status_sub{ORB_ID(vehicle_status)};
++	uORB::Subscription _land_sub{ORB_ID(vehicle_land_detected)};
++	uORB::Subscription _armed_sub{ORB_ID(actuator_armed)};
++
++	uORB::Publication<flip_recovery_control_s> _control_pub{ORB_ID(flip_recovery_control)};
++	uORB::Publication<flip_recovery_status_s> _flip_status_pub{ORB_ID(flip_recovery_status)};
++	uORB::Publication<actuator_motors_s> _motors_pub{ORB_ID(actuator_motors)};
++	uORB::Publication<vehicle_command_s> _command_pub{ORB_ID(vehicle_command)};
++
++	manual_control_setpoint_s _manual{};
++	vehicle_attitude_s _attitude{};
++	vehicle_angular_velocity_s _angular_velocity{};
++	vehicle_status_s _status{};
++	vehicle_land_detected_s _land{};
++	actuator_armed_s _armed{};
++
++	flip_recovery::FlipPlanner _planner;
++	flip_recovery::Layout _layout{};
++	flip_recovery::Plan _plan{};
++
++	bool _mode_active{false};      // nav_state == FLIP_RECOVERY
++	bool _attitude_valid{false};
++	bool _gyro_valid{false};
++	bool _rc_ready{false};
++	bool _safe{false};
++	bool _exit_requested{false};   // Done/Failed 后已发过切回命令
++	float _tilt{NAN};
++	uint8_t _quat_reset{0};
++	flip_recovery::Zone _last_zone{flip_recovery::Zone::Off};
++
++	// 给上位机的执行结果（见 flip_recovery_status.msg）
++	uint64_t _session_start{0};
++	uint8_t _result{flip_recovery_status_s::RESULT_NONE};
++	float _duration{0.f};
++
++	DEFINE_PARAMETERS(
++		(ParamBool<px4::params::FLIP_EN>)         _param_en,
++		(ParamInt<px4::params::FLIP_RC_CONFIRM>)  _param_rc_confirm,
++		(ParamInt<px4::params::FLIP_EXIT_MODE>)   _param_exit_mode,
++		(ParamInt<px4::params::FLIP_MODE>)        _param_mode,
++		(ParamFloat<px4::params::FLIP_ENTRY_ANG>) _param_entry_ang,
++		(ParamFloat<px4::params::FLIP_STOP_ANG>)  _param_stop_ang,
++		(ParamFloat<px4::params::FLIP_THR_HIGH>)  _param_thr_high,
++		(ParamFloat<px4::params::FLIP_THR_LOW>)   _param_thr_low,
++		(ParamInt<px4::params::FLIP_LOW_MODE>)    _param_low_mode,
++		(ParamFloat<px4::params::FLIP_SLEW>)      _param_slew,
++		(ParamFloat<px4::params::FLIP_TIME>)      _param_time,
++		(ParamFloat<px4::params::FLIP_MIN_PROG>)  _param_min_prog,
++		(ParamFloat<px4::params::FLIP_PROG_T>)    _param_prog_t,
++		(ParamBool<px4::params::FLIP_OUT_DIRECT>) _param_out_direct
++	)
++};
+diff --git a/src/modules/flip_recovery/Kconfig b/src/modules/flip_recovery/Kconfig
+new file mode 100644
+index 0000000000..32522e73f4
+--- /dev/null
++++ b/src/modules/flip_recovery/Kconfig
+@@ -0,0 +1,5 @@
++menuconfig MODULES_FLIP_RECOVERY
++	bool "flip_recovery"
++	default n
++	---help---
++		Enable the tilt flip recovery module (auto righting from 60-180 deg tilt).
+diff --git a/src/modules/flip_recovery/flip_recovery_params.c b/src/modules/flip_recovery/flip_recovery_params.c
+new file mode 100644
+index 0000000000..9880ca3083
+--- /dev/null
++++ b/src/modules/flip_recovery/flip_recovery_params.c
+@@ -0,0 +1,205 @@
++/****************************************************************************
++ * flip_recovery 参数
++ ****************************************************************************/
++
++/**
++ * 使能倾角翻正
++ *
++ * 关闭时模块仍可运行（模式可以进，但不出力、只报状态）。
++ * 这是一个总保险：即使拨错开关，也不会转桨。
++ *
++ * @boolean
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_EN, 0);
++
++/**
++ * 遥控二次确认通道
++ *
++ * 0 = 不需要二次确认，进入模式即开始翻正。
++ * 1..6 = 除模式开关外，还必须把对应 aux1..aux6 通道打到高位才开始出力。
++ * 作用：模式开关在拨杆上容易被误碰，加一路开关做双保险。
++ *
++ * @min 0
++ * @max 6
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_RC_CONFIRM, 0);
++
++/**
++ * 翻正结束后切回的模式
++ *
++ * 与 COM_FLTMODE 的取值含义一致：
++ * 0=Manual, 1=Altitude, 2=Position, 3=Mission, 4=Hold, 5=Return,
++ * 6=Acro, 7=Offboard, 8=Stabilized。
++ *
++ * @min 0
++ * @max 8
++ * @value 0 Manual
++ * @value 1 Altitude
++ * @value 2 Position
++ * @value 3 Mission
++ * @value 4 Hold
++ * @value 5 Return
++ * @value 6 Acro
++ * @value 7 Offboard
++ * @value 8 Stabilized
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_EXIT_MODE, 2);
++
++/**
++ * 翻正策略
++ *
++ * 0 = 翻过去（默认）：60~90° 把高位压下去回正；90~180° 把高位抬起来，
++ *     让机身绕低位那条棱继续翻过 180°（180°→270°→360° 回到正立）。
++ *     等效于「高位全程反转、低位全程正转」，90° 处不需要切换电机转向。
++ * 1 = 压回去：60~180° 全程把高位压下去，始终朝 0° 方向拉。路径最短，
++ *     但 90° 处要切换一次电机转向。
++ *
++ * 两者在 60~90° 完全一致，只在 90~180° 不同。
++ *
++ * @min 0
++ * @max 1
++ * @value 0 Flip over
++ * @value 1 Press back
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_MODE, 0);
++
++/**
++ * 进入门限（倾角）
++ *
++ * 倾角超过该值才开始出力。倾角定义：0° 正立，90° 侧躺，180° 完全倒扣。
++ *
++ * @unit deg
++ * @min 60
++ * @max 180
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_ENTRY_ANG, 75.0f);
++
++/**
++ * 停止门限（倾角）
++ *
++ * 倾角小于该值即收油，剩余部分交给重力完成。必须小于进入门限（形成回差）。
++ *
++ * @unit deg
++ * @min 0
++ * @max 120
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_STOP_ANG, 60.0f);
++
++/**
++ * 高位组油门
++ *
++ * 高位 = 在真实世界里离地面较高的那两路电机。它们离翻正转轴最远、力臂最大，
++ * 是唯一真正产生翻正力矩的组，所以这里给的是全额油门（不打折）。
++ *
++ * DShot 归一化油门（0..1），不是推力或功率百分比。起步建议 0.15~0.25。
++ *
++ * @min 0.02
++ * @max 0.6
++ * @increment 0.01
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_THR_HIGH, 0.20f);
++
++/**
++ * 低位组油门
++ *
++ * 低位 = 贴地的那两路电机。它们就在翻正转轴上，力臂约等于 0，
++ * 推力几乎不产生力矩，只负责"抬一点、卸掉地面正压力、减小绕轴摩擦"。
++ *
++ * 正常应明显低于高位（默认 0.10）。测试时可以随便调，甚至设得比高位还大。
++ * 配合 FLIP_LOW_MODE 可以进一步强制低位的转向或直接关掉。
++ *
++ * @min 0
++ * @max 0.6
++ * @increment 0.01
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_THR_LOW, 0.10f);
++
++/**
++ * 低位组转向模式
++ *
++ * 调试接口。正常用 0（自动），低位会一直朝"抬"的方向转，只是 90° 前后
++ * 对应的电机转向不同（60~90° 正转，90~180° 反转）。
++ *
++ * 1/2 用来做对照实验：强制低位正转或反转，观察是否更顺。
++ * 3 用来验证"低位完全不转、纯靠高位"能不能翻得动。
++ *
++ * @min 0
++ * @max 3
++ * @value 0 Auto (always lift)
++ * @value 1 Force normal
++ * @value 2 Force reversed
++ * @value 3 Off
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_LOW_MODE, 0);
++
++/**
++ * 油门上升率
++ *
++ * 单位：每秒增加的归一化油门。越小越温和。
++ *
++ * @unit 1/s
++ * @min 0.05
++ * @max 2.0
++ * @increment 0.05
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_SLEW, 0.50f);
++
++/**
++ * 总出力时长上限
++ *
++ * 超过即判失败并停止（防止电机/电调过热）。
++ *
++ * @unit s
++ * @min 0.2
++ * @max 5.0
++ * @increment 0.1
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_TIME, 3.0f);
++
++/**
++ * 最短进度要求
++ *
++ * 在 FLIP_PROG_T 时间内倾角减少不足该值，判定"选错边或推力不够"并退出。
++ *
++ * @unit deg
++ * @min 0
++ * @max 30
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_MIN_PROG, 3.0f);
++
++/**
++ * 进度判定起始时间
++ *
++ * 出力多久之后开始检查 FLIP_MIN_PROG。
++ *
++ * @unit s
++ * @min 0.2
++ * @max 2.0
++ * @increment 0.1
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_FLOAT(FLIP_PROG_T, 0.8f);
++
++/**
++ * 台架直出模式
++ *
++ * 1 = 直接发布 actuator_motors 驱动"正转组"（仅台架测试）。
++ * 进入翻正模式后 control_allocator 会让位，不会与本模块抢 actuator_motors。
++ * 反转组仍然只能靠驱动层实现。
++ *
++ * @boolean
++ * @group Flip Recovery
++ */
++PARAM_DEFINE_INT32(FLIP_OUT_DIRECT, 0);
+diff --git a/src/modules/manual_control/ManualControl.cpp b/src/modules/manual_control/ManualControl.cpp
+index 517639100c..45301aa5de 100644
+--- a/src/modules/manual_control/ManualControl.cpp
++++ b/src/modules/manual_control/ManualControl.cpp
+@@ -591,6 +591,7 @@ int8_t ManualControl::navStateFromParam(int32_t param_value)
+ 		case 14: return vehicle_status_s::NAVIGATION_STATE_ORBIT;
+ 		case 15: return vehicle_status_s::NAVIGATION_STATE_AUTO_VTOL_TAKEOFF;
+ 		case 16: return vehicle_status_s::NAVIGATION_STATE_ALTITUDE_CRUISE;
++		case 17: return vehicle_status_s::NAVIGATION_STATE_FLIP_RECOVERY;
+ 
+ 		case 100: return vehicle_status_s::NAVIGATION_STATE_EXTERNAL1;
+ 		case 101: return vehicle_status_s::NAVIGATION_STATE_EXTERNAL2;
